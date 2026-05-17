@@ -1,6 +1,7 @@
 import { logger } from '@/ui/logger'
 import { EventEmitter } from 'node:events'
 import { io, Socket } from 'socket.io-client'
+import { getProxyAgentForUrl } from '@/utils/proxyAgent'
 import { AgentState, ClientToServerEvents, FileEventMessage, FileEventMessageSchema, Metadata, ServerToClientEvents, Session, Update, UserMessage, UserMessageSchema, Usage } from './types'
 import { decodeBase64, decryptBlob, decrypt, encodeBase64, encrypt } from './encryption';
 import { backoff, delay } from '@/utils/time';
@@ -143,6 +144,7 @@ export class ApiSessionClient extends EventEmitter {
         // Create socket
         //
 
+        const agent = getProxyAgentForUrl(configuration.serverUrl);
         this.socket = io(configuration.serverUrl, {
             auth: {
                 token: this.token,
@@ -154,8 +156,9 @@ export class ApiSessionClient extends EventEmitter {
             reconnection: false,
             transports: ['websocket'],
             withCredentials: true,
-            autoConnect: false
-        });
+            autoConnect: false,
+            ...(agent ? { agent } : {}),
+        } as Parameters<typeof io>[1]);
 
         //
         // Handlers
