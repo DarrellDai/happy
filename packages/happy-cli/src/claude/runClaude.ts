@@ -18,6 +18,7 @@ import { initialMachineMetadata } from '@/daemon/run';
 import { startHappyServer } from '@/claude/utils/startHappyServer';
 import { startHookServer } from '@/claude/utils/startHookServer';
 import { generateHookSettingsFile, cleanupHookSettingsFile } from '@/claude/utils/generateHookSettings';
+import { getSessionNotificationCopy } from '@/api/pushNotifications';
 import { registerKillSessionHandler } from './registerKillSessionHandler';
 import { projectPath } from '../projectPath';
 import { resolve } from 'node:path';
@@ -376,10 +377,13 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             }
         },
         // Fire "It's ready!" push when Claude finishes a turn in local
-        // (interactive/terminal) mode. The remote launcher already fires
-        // its own done push via the SDK's onReady callback, so guard on
-        // mode to avoid duplicates. Server-side presence suppression still
-        // applies (skipped when any other Happy client is foregrounded).
+        // (interactive/terminal) mode. We go direct to Expo via
+        // sendToAllDevices instead of sendSessionNotification because the
+        // server-routed path suppresses whenever the user has any
+        // non-machine socket connected — and the CLI itself counts as one,
+        // so the push would never fire while a `happy claude` is running.
+        // The remote launcher's SDK onReady callback still uses the
+        // server-routed path, so we guard on mode to avoid duplicates.
         onStopHook: () => {
             if (!currentSession || currentSession.mode !== 'local') {
                 return;
@@ -387,14 +391,13 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             if (!currentSession.sessionId) {
                 return;
             }
-            currentSession.api.push().sendSessionNotification({
+            const metadata = currentSession.client.getMetadata();
+            const { title, body } = getSessionNotificationCopy('done', metadata);
+            currentSession.api.push().sendToAllDevices(title, body, {
+                sessionId: currentSession.client.sessionId,
                 kind: 'done',
-                metadata: currentSession.client.getMetadata(),
-                data: {
-                    sessionId: currentSession.client.sessionId,
-                    type: 'ready',
-                    provider: 'claude',
-                }
+                type: 'ready',
+                provider: 'claude',
             });
         }
     });
