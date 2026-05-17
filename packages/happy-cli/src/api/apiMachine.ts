@@ -6,6 +6,7 @@
 import { io, Socket } from 'socket.io-client';
 import { logger } from '@/ui/logger';
 import { configuration } from '@/configuration';
+import { getProxyAgentForUrl } from '@/utils/proxyAgent';
 import { MachineMetadata, DaemonState, Machine, Update, UpdateMachineBody } from './types';
 import { registerCommonHandlers, SpawnSessionOptions, SpawnSessionResult } from '../modules/common/registerCommonHandlers';
 import { encodeBase64, decodeBase64, encrypt, decrypt } from './encryption';
@@ -354,7 +355,8 @@ export class ApiMachineClient {
 
     connect() {
         const serverUrl = configuration.serverUrl.replace(/^http/, 'ws');
-        logger.debug(`[API MACHINE] Connecting to ${serverUrl}`);
+        const agent = getProxyAgentForUrl(configuration.serverUrl);
+        logger.debug(`[API MACHINE] Connecting to ${serverUrl}${agent ? ' via proxy' : ''}`);
 
         this.socket = io(serverUrl, {
             transports: ['websocket'],
@@ -366,7 +368,8 @@ export class ApiMachineClient {
             },
             path: '/v1/updates',
             reconnection: false,
-        });
+            ...(agent ? { agent } : {}),
+        } as Parameters<typeof io>[1]);
 
         this.socket.on('connect', () => {
             logger.debug('[API MACHINE] Connected to server');
