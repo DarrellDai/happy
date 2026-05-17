@@ -374,6 +374,28 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                     currentSession.onSessionFound(sessionId);
                 }
             }
+        },
+        // Fire "It's ready!" push when Claude finishes a turn in local
+        // (interactive/terminal) mode. The remote launcher already fires
+        // its own done push via the SDK's onReady callback, so guard on
+        // mode to avoid duplicates. Server-side presence suppression still
+        // applies (skipped when any other Happy client is foregrounded).
+        onStopHook: () => {
+            if (!currentSession || currentSession.mode !== 'local') {
+                return;
+            }
+            if (!currentSession.sessionId) {
+                return;
+            }
+            currentSession.api.push().sendSessionNotification({
+                kind: 'done',
+                metadata: currentSession.client.getMetadata(),
+                data: {
+                    sessionId: currentSession.client.sessionId,
+                    type: 'ready',
+                    provider: 'claude',
+                }
+            });
         }
     });
     logger.debug(`[START] Hook server started on port ${hookServer.port}`);

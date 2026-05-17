@@ -41,6 +41,17 @@ export function generateHookSettingsFile(port: number): string {
                         }
                     ]
                 }
+            ],
+            Stop: [
+                {
+                    matcher: "*",
+                    hooks: [
+                        {
+                            type: "command",
+                            command: hookCommand
+                        }
+                    ]
+                }
             ]
         }
     };

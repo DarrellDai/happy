@@ -74,8 +74,10 @@ export interface SessionHookData {
 }
 
 export interface HookServerOptions {
-    /** Called when a session hook is received with a valid session ID */
+    /** Called when a SessionStart hook is received with a valid session ID */
     onSessionHook: (sessionId: string, data: SessionHookData) => void;
+    /** Called when a Stop hook is received (assistant finished a turn) */
+    onStopHook?: (data: SessionHookData) => void;
 }
 
 export interface HookServer {
@@ -92,11 +94,12 @@ export interface HookServer {
  * @returns Promise resolving to the server instance with port info
  */
 export async function startHookServer(options: HookServerOptions): Promise<HookServer> {
-    const { onSessionHook } = options;
+    const { onSessionHook, onStopHook } = options;
 
     return new Promise((resolve, reject) => {
         const server: Server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-            // Only handle POST to /hook/session-start
+            // Handle POST to /hook/session-start — dispatch by Claude's hook_event_name
+            // (SessionStart, Stop, and future kinds all forwarded by the same script).
             if (req.method === 'POST' && req.url === '/hook/session-start') {
                 // Set timeout to prevent hanging if Claude doesn't close stdin
                 const timeout = setTimeout(() => {
@@ -123,13 +126,22 @@ export async function startHookServer(options: HookServerOptions): Promise<HookS
                         logger.debug('[hookServer] Failed to parse hook data as JSON:', parseError);
                     }
 
-                    // Support both snake_case (from Claude) and camelCase
-                    const sessionId = data.session_id || data.sessionId;
-                    if (sessionId) {
-                        logger.debug(`[hookServer] Session hook received session ID: ${sessionId}`);
-                        onSessionHook(sessionId, data);
+                    const eventName = typeof data.hook_event_name === 'string'
+                        ? data.hook_event_name
+                        : null;
+
+                    if (eventName === 'Stop') {
+                        logger.debug('[hookServer] Stop hook received');
+                        onStopHook?.(data);
                     } else {
-                        logger.debug('[hookServer] Session hook received but no session_id found in data');
+                        // SessionStart (or legacy unnamed) — keep sessionId-driven behavior.
+                        const sessionId = data.session_id || data.sessionId;
+                        if (sessionId) {
+                            logger.debug(`[hookServer] Session hook received session ID: ${sessionId}`);
+                            onSessionHook(sessionId, data);
+                        } else {
+                            logger.debug('[hookServer] Session hook received but no session_id found in data');
+                        }
                     }
 
                     res.writeHead(200, { 'Content-Type': 'text/plain' }).end('ok');
