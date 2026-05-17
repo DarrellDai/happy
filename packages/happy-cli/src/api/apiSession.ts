@@ -150,7 +150,13 @@ export class ApiSessionClient extends EventEmitter {
                 token: this.token,
                 clientType: 'session-scoped' as const,
                 sessionId: this.sessionId,
-                happyClient: `cli-coding-session/${configuration.currentCliVersion}`
+                happyClient: `cli-coding-session/${configuration.currentCliVersion}`,
+                // CLI sessions are agents, not user-facing UIs. Reporting
+                // background prevents the server from treating us as a
+                // presence signal — without this, `hasActiveNonMachineSocket`
+                // is always true while a `happy claude` is running, which
+                // suppresses every session-event push (e.g. "It's ready!").
+                appState: 'background',
             },
             path: '/v1/updates',
             reconnection: false,
