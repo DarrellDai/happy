@@ -189,13 +189,14 @@ export const MultiTextInput = React.memo(React.forwardRef<MultiTextInputHandle, 
         getText: () => latestTextRef.current,
         setTextAndSelection: (text: string, selection: { start: number; end: number }) => {
             if (inputRef.current) {
-                // setNativeProps({ text: '' }) is unreliable on Android — the
-                // empty value can be silently dropped, leaving the previous
-                // text on screen. Use the dedicated TextInput.clear() for
-                // empty strings and setNativeProps for everything else.
-                if (text === '') {
-                    inputRef.current.clear();
-                    inputRef.current.setNativeProps({ selection });
+                // Multiline TextInput on Android silently drops setNativeProps
+                // ({ text: '' }) (and TextInput.clear() — same underlying call).
+                // Workaround: write a non-empty placeholder first, then the
+                // actual empty value. The two-step write forces Android to
+                // commit the change.
+                if (text === '' && Platform.OS === 'android') {
+                    inputRef.current.setNativeProps({ text: ' ' });
+                    inputRef.current.setNativeProps({ text: '', selection });
                 } else {
                     inputRef.current.setNativeProps({
                         text: text,
