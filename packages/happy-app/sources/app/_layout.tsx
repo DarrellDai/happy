@@ -60,8 +60,11 @@ if (Platform.OS === 'android') {
         lightColor: '#FF231F7C',
         sound: 'default',
     });
+    // Session-event channel — server sends pushes with channelId='messages'.
+    // Display name is "AI" so it appears as its own category in OS notification
+    // settings; the user can pick a distinctive ringtone there.
     Notifications.setNotificationChannelAsync('messages', {
-        name: 'Messages',
+        name: 'AI',
         importance: Notifications.AndroidImportance.HIGH,
         vibrationPattern: [0, 250, 250, 250],
         lightColor: '#FF231F7C',
