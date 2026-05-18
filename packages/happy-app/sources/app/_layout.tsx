@@ -36,18 +36,14 @@ import { useTauriZoom } from '@/hooks/useTauriZoom';
 import { useTauriDrag } from '@/hooks/useTauriDrag';
 
 // Configure notification handler — always surface incoming pushes as
-// banners/alerts, even when the app is foregrounded. The previous behavior
-// suppressed the banner when AppState was 'active', which on Android could
-// mean "process is running in the background but not killed" rather than
-// "user is looking at the app". The CLI-driven workflow needs the banner
-// regardless. Sound stays foreground-aware to avoid double-buzzing when
-// the user is genuinely inside the app.
+// banners/alerts (with sound), even when the app is foregrounded. The CLI-driven
+// workflow needs the banner regardless, and the user explicitly wants sound to
+// play even when inside the app so they don't miss it.
 Notifications.setNotificationHandler({
     handleNotification: async () => {
-        const isForeground = AppState.currentState === 'active';
         return {
             shouldShowAlert: true,
-            shouldPlaySound: !isForeground,
+            shouldPlaySound: true,
             shouldSetBadge: true,
             shouldShowBanner: true,
             shouldShowList: true,
@@ -62,12 +58,14 @@ if (Platform.OS === 'android') {
         importance: Notifications.AndroidImportance.MAX,
         vibrationPattern: [0, 250, 250, 250],
         lightColor: '#FF231F7C',
+        sound: 'default',
     });
     Notifications.setNotificationChannelAsync('messages', {
         name: 'Messages',
         importance: Notifications.AndroidImportance.HIGH,
         vibrationPattern: [0, 250, 250, 250],
         lightColor: '#FF231F7C',
+        sound: 'default',
     });
 }
 
