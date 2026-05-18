@@ -189,11 +189,19 @@ export const MultiTextInput = React.memo(React.forwardRef<MultiTextInputHandle, 
         getText: () => latestTextRef.current,
         setTextAndSelection: (text: string, selection: { start: number; end: number }) => {
             if (inputRef.current) {
-                // Use setNativeProps for direct manipulation
-                inputRef.current.setNativeProps({
-                    text: text,
-                    selection: selection
-                });
+                // setNativeProps({ text: '' }) is unreliable on Android — the
+                // empty value can be silently dropped, leaving the previous
+                // text on screen. Use the dedicated TextInput.clear() for
+                // empty strings and setNativeProps for everything else.
+                if (text === '') {
+                    inputRef.current.clear();
+                    inputRef.current.setNativeProps({ selection });
+                } else {
+                    inputRef.current.setNativeProps({
+                        text: text,
+                        selection: selection
+                    });
+                }
 
                 latestTextRef.current = text;
                 selectionRef.current = selection;
