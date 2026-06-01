@@ -87,12 +87,18 @@ class ApiSocket {
 
         this.socket = io(this.config.endpoint, {
             path: '/v1/updates',
-            auth: {
-                token: this.config.token,
+            // auth is a FUNCTION (not a static object) so socket.io re-evaluates
+            // it before every (re)connection. Keeping appState fresh on each
+            // reconnect is critical on Android: a backgrounded app keeps
+            // dropping/reconnecting, and a frozen object would re-handshake the
+            // stale launch-time 'active', making the server suppress pushes until
+            // the app is force-killed. See getCurrentAppState() / sync.ts focus.
+            auth: (cb) => cb({
+                token: this.config!.token,
                 clientType: 'user-scoped' as const,
                 happyClient: getHappyClientId(),
                 appState: getCurrentAppState(),
-            },
+            }),
             transports: ['websocket'],
             reconnection: true,
             reconnectionDelay: 1000,
