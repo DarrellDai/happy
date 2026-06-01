@@ -178,6 +178,16 @@ class Sync {
                     this.failPendingOutboxMessages('Message failed to send in background after 30s. Please retry.');
                 }
                 log.log('📱 App became active');
+                // Clear delivered push notifications when the app is opened.
+                // Happy never dismissed them, so they accumulate until the app
+                // hits Android's hard cap of 50 active notifications per package —
+                // after which the OS silently drops every new push ("Package has
+                // already posted or enqueued 50 notifications. Not showing more").
+                // That is why pushes only reappeared after a force-stop (which
+                // clears the pile). Dismissing on foreground keeps the count low so
+                // new pushes are never blocked.
+                void Notifications.dismissAllNotificationsAsync().catch(() => {});
+                void Notifications.setBadgeCountAsync(0).catch(() => {});
                 this.purchasesSync.invalidate();
                 this.profileSync.invalidate();
                 this.machinesSync.invalidate();
