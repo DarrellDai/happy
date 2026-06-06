@@ -39,8 +39,29 @@ import { useTauriDrag } from '@/hooks/useTauriDrag';
 // banners/alerts (with sound), even when the app is foregrounded. The CLI-driven
 // workflow needs the banner regardless, and the user explicitly wants sound to
 // play even when inside the app so they don't miss it.
+//
+// Before surfacing a new notification, dismiss any existing notification from
+// the same session so each session holds at most 1 slot in the tray. Without
+// this, every Claude turn-done push from every active session accumulates and
+// the Android 50-notification-per-app hard cap is hit within hours.
+// Note: this only runs while the app is in the foreground; background/killed
+// notifications are posted directly by the OS and can't be intercepted here.
 Notifications.setNotificationHandler({
-    handleNotification: async () => {
+    handleNotification: async (notification) => {
+        try {
+            const incoming = notification.request.content.data;
+            const sessionId = typeof incoming?.sessionId === 'string' ? incoming.sessionId : null;
+            if (sessionId) {
+                const presented = await Notifications.getPresentedNotificationsAsync();
+                for (const n of presented) {
+                    if (n.request.content.data?.sessionId === sessionId) {
+                        void Notifications.dismissNotificationAsync(n.request.identifier).catch(() => {});
+                    }
+                }
+            }
+        } catch {
+            // never block a notification due to a dismissal error
+        }
         return {
             shouldShowAlert: true,
             shouldPlaySound: true,
