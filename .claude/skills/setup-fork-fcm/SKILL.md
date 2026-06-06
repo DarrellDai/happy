@@ -36,16 +36,52 @@ The user should have a personal Expo account and an EAS project under it. If the
 
 ```bash
 npx eas-cli@latest login          # interactive
-# Then edit packages/happy-app/app.config.js to remove `owner` field
-# and clear `extra.eas.projectId`. Run:
+# Then edit packages/happy-app/app.config.js — see "Three fields to swap" below
 npx eas-cli@latest init           # creates a new project under their account
 # Note the new projectId. Put it in app.config.js for the duration of builds.
 ```
 
-These config edits are *temporary, build-time only* — they MUST be reverted before any git commit (the upstream PR shouldn't include the fork-specific projectId or `owner` removal). Keep the upstream values in mind:
+These config edits are *temporary, build-time only* — they MUST be reverted before any git commit (the upstream PR shouldn't include the fork-specific projectId, url, or `owner` removal). Keep the upstream values in mind:
 
 - Upstream `owner`: `bulkacorp`
 - Upstream `eas.projectId`: `4558dd3d-cd5a-47cd-bad9-e591a241cc06`
+- Upstream `updates.url`: `https://u.expo.dev/4558dd3d-cd5a-47cd-bad9-e591a241cc06`
+
+### Three fields to swap (ALL of them — missing any is a permanent build defect)
+
+`packages/happy-app/app.config.js` has **three** places that reference the
+upstream project. ALL three must be swapped to fork values before a build —
+or commented/replaced as noted. Missing ANY of them creates a half-fork APK
+that misbehaves in subtle ways that no later OTA can fix:
+
+```js
+// (a) updates.url — line ~176. This is the URL the installed APK queries at
+//     launch to fetch OTAs. If left at upstream, this build is PERMANENTLY
+//     blind to your OTAs — every `eas update` to your fork will publish
+//     successfully but the device will keep getting `isUpdateAvailable=false`
+//     / `NoUpdatesAvailable` because it's hitting upstream's server. The only
+//     remedy is a rebuild. This is the most-commonly-missed of the three.
+updates: {
+    url: "https://u.expo.dev/4558dd3d-cd5a-47cd-bad9-e591a241cc06",  // → fork's projectId
+    requestHeaders: { "expo-channel-name": "production" }
+}
+
+// (b) extra.eas.projectId — line ~189. Identifies which EAS project the
+//     build belongs to (build:list/build:view/credentials lookups, FCM key
+//     pairing). If left at upstream, EAS rejects the build (no permission).
+extra: { eas: { projectId: "4558dd3d-cd5a-47cd-bad9-e591a241cc06" } }  // → fork's projectId
+
+// (c) owner — line ~200. Must be commented out (the fork's project has no
+//     explicit owner; it defaults to the logged-in user). If left as
+//     "bulkacorp", EAS rejects the build with an ownership error.
+owner: "bulkacorp"  // → // owner: "bulkacorp"
+```
+
+A correctly-swapped fork build's APK manifest will show **fork** projectId in
+the `EXPO_UPDATE_URL` metadata. Verify post-build via the APK-manifest
+extraction in `happy-ota-publish-to-fork` ("Verify the APK's baked update
+target") BEFORE relying on OTAs to this build — there's a long tail of
+mixed-config builds in the wild because swap (a) is easy to forget.
 
 ### 2. Create the Firebase project
 
@@ -107,15 +143,55 @@ npx eas-cli@latest credentials -p android
 
 ### 8. Trigger a fresh preview build
 
-The build has to bake the new `google-services.json` into the APK so the app registers FCM tokens under the right Firebase project. Same temporary-config-edit dance as `eas init`:
+The build has to bake the new `google-services.json` into the APK so the app
+registers FCM tokens under the right Firebase project. Apply the three-field
+swap from step 1 (`updates.url`, `extra.eas.projectId`, `owner`).
+
+**Throwaway-commit gotcha.** By default `eas build` bundles the latest
+committed state of the working tree, **NOT** the dirty edits you just made.
+If you run `eas build` with the three config edits still uncommitted, EAS
+silently ships *the upstream-committed config* to the cloud build — the
+resulting APK has upstream's projectId/url and is the exact "permanent OTA
+blindness" failure described in step 1. The same applies to a swapped-in
+fork `google-services.json` — if the tree's committed copy is the
+upstream/stale one, the build bakes that, not your fork's. Two safe shapes:
 
 ```bash
 cd /home/darrelldai/Projects/happy/packages/happy-app
-# Temporarily set fork's projectId in app.config.js and comment out `owner`
-# (see the dance pattern used in earlier builds)
+
+# Option A (recommended) — throwaway local commit, build from it, undo after.
+#   Lets you keep the upstream values committed on the branch you actually
+#   push to upstream, while still feeding the fork values to EAS.
+git add app.config.js google-services.json
+git commit -m "TEMP: fork build config (REVERT)"
+TEMP_SHA=$(git rev-parse HEAD)
+
 npx eas-cli@latest build --platform android --profile preview --non-interactive
-# Build runs ~15 min. Revert app.config.js immediately after submission.
+# (Build kicks off ~30s after upload, runs ~15-20 min on EAS.)
+
+# Once EAS has the upload, immediately undo the temp commit so working state
+# matches main again. The build keeps running on EAS regardless.
+git reset --soft HEAD~1                # drops the commit, keeps changes staged
+git restore --staged app.config.js google-services.json   # unstage
+git checkout -- app.config.js          # restore upstream values
+# google-services.json stays as the fork's file in the working tree (NOT to be committed).
+
+# Option B — build from the dirty tree without committing.
+#   Pass --no-wait and answer "Yes" to the "tree is dirty, build anyway?"
+#   prompt. Less reliable historically (EAS' detection of which files end
+#   up in the upload bundle has flipped between versions); Option A is the
+#   safer default.
 ```
+
+After kicking off the build, immediately verify the upload's config is
+**fork-aligned** by viewing the build in the dashboard or via
+`eas build:view <buildId>` (note: `build:view` reads `extra.eas.projectId`
+from your current `app.config.js`, so you may need to temporarily re-swap
+it back to the fork projectId to make this query work — same swap pattern,
+or `unset` it and pass `--platform android` explicitly). If `Channel` and
+`Runtime Version` look right but you have any doubt about the URL field, do
+the APK-manifest verification from `happy-ota-publish-to-fork` after the
+build completes — that's the only authoritative check.
 
 ### 9. Install and verify
 
@@ -173,3 +249,5 @@ These files are all per-fork configuration and must not pollute the upstream PR.
 - **`Unable to retrieve the FCM server key`** — same root cause: Expo project has no FCM credentials yet. Do step 7.
 - **Build fails with package-name error** — the Android app for that build profile's bundle ID isn't registered in the Firebase project. Add it via step 3, re-download `google-services.json`, rebuild.
 - **App crashes on launch / Firebase init failure** — the bundled `google-services.json` doesn't include the app's package name. Same fix: register the package in Firebase, re-download, rebuild.
+- **Build succeeds, push works, but every `eas update` shows `isUpdateAvailable=false` / `NoUpdatesAvailable` on the device** — `updates.url` was left at upstream when the APK was built (step 1 swap (a) was missed, or the throwaway-commit pattern in step 8 was skipped so EAS picked up the upstream-committed config). The installed APK is permanently querying upstream's update server and can never receive your fork's OTAs. Diagnose via the APK-manifest check in `happy-ota-publish-to-fork`. Only fix is to rebuild with all three swaps applied — this is **the** canonical fork-build mistake.
+- **Build succeeds with the right `updates.url` but push breaks (InvalidCredentials)** — the tree's `google-services.json` doesn't match what's committed in EAS's FCM credentials store (e.g. someone re-downloaded the file from a *different* Firebase project than the one whose FCM key was uploaded in step 7). Always verify the installed APK's Firebase sender prefix against the tree's `google-services.json` BEFORE kicking off a build (see `happy-ota-publish-to-fork` "Cross-check: which Firebase project did this APK bake in?"). `google-services.json` is normally tracked in git but typically only one historical version exists, so if the tree drifted to the wrong project, git history won't recover it — only the Firebase console can.
