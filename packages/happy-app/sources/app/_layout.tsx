@@ -282,6 +282,21 @@ export default function RootLayout() {
     }, [initState]);
 
     const handledNotificationIds = React.useRef<Set<string>>(new Set());
+    const [pendingSessionId, setPendingSessionId] = React.useState<string | null>(null);
+
+    // Deferred navigation: fires after the render that set pendingSessionId, so
+    // the Drawer/Stack navigator has had a chance to fully mount (important on
+    // cold start where router.push synchronously after setInitState is dropped
+    // by react-navigation before its native layers are committed).
+    React.useEffect(() => {
+        if (!pendingSessionId || !initState) {
+            return;
+        }
+        console.log(`[PUSH ROUTING] Deferred navigation to session: ${pendingSessionId}`);
+        navigateToSession(router, pendingSessionId);
+        setPendingSessionId(null);
+    }, [pendingSessionId, initState, router]);
+
     const handleNotificationResponse = React.useCallback(async (response: Notifications.NotificationResponse | null) => {
         if (!response) {
             console.log('[PUSH ROUTING] Notification response is null');
@@ -323,8 +338,8 @@ export default function RootLayout() {
                     return encodedSessionId;
                 }
             })();
-            console.log(`[PUSH ROUTING] Navigating to session: ${sessionId}`);
-            navigateToSession(router, sessionId);
+            console.log(`[PUSH ROUTING] Queuing navigation to session: ${sessionId}`);
+            setPendingSessionId(sessionId);
         } finally {
             try {
                 await Notifications.clearLastNotificationResponseAsync();
@@ -332,7 +347,7 @@ export default function RootLayout() {
                 console.log('Failed to clear last notification response:', error);
             }
         }
-    }, [router]);
+    }, []);
 
     React.useEffect(() => {
         if (!initState) {

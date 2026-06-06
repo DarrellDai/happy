@@ -141,8 +141,12 @@ export class PushNotificationClient {
             return
         }
 
-        // Create chunks to respect Expo's rate limits
-        const chunks = this.expo.chunkPushNotifications(validMessages)
+        // Send each token in its own request. Expo rejects entire batches when
+        // tokens from different Expo projects are mixed — e.g. a fork-build token
+        // (darrelldai project) + a Play Store token (bulkacorp project) in the same
+        // request silently kills ALL delivery. One request per token is slightly less
+        // efficient (2 HTTP calls instead of 1 for 2 tokens) but completely immune.
+        const chunks = validMessages.map(m => [m])
 
         for (const chunk of chunks) {
             // Retry with exponential backoff for 5 minutes
