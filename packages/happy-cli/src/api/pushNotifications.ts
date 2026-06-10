@@ -71,15 +71,47 @@ export function getSessionNotificationCopy(
     }
 }
 
+// Per-kind minimum gap between successive pushes for the same session.
+// Prevents 30+ parallel sessions from flooding the Android 50-notification
+// hard cap. "done" fires on every Claude turn finish; "permission" and
+// "question" can also fire repeatedly from a busy session.
+const PUSH_DEBOUNCE_MS: Record<string, number> = {
+    done: 3 * 60 * 1000,       // 3 minutes
+    permission: 2 * 60 * 1000, // 2 minutes
+    question: 2 * 60 * 1000,   // 2 minutes
+}
+
 export class PushNotificationClient {
     private readonly token: string
     private readonly baseUrl: string
     private readonly expo: Expo
+    /** `${kind}:${sessionId}` → timestamp of the last push we actually sent */
+    private readonly lastPushTime = new Map<string, number>()
 
     constructor(token: string, baseUrl: string = 'https://api.cluster-fluster.com') {
         this.token = token
         this.baseUrl = baseUrl
         this.expo = new Expo()
+    }
+
+    /**
+     * Returns true if a push of this kind for this session should be suppressed
+     * because one was already sent within the debounce window.
+     * Records the send time when it returns false.
+     * Kinds not listed in PUSH_DEBOUNCE_MS are never suppressed.
+     */
+    private shouldSuppressPush(sessionId: string, kind: string): boolean {
+        const debounce = PUSH_DEBOUNCE_MS[kind]
+        if (debounce === undefined) return false
+        const key = `${kind}:${sessionId}`
+        const last = this.lastPushTime.get(key)
+        const now = Date.now()
+        if (last !== undefined && now - last < debounce) {
+            logger.debug(`[PUSH] Suppressing "${kind}" push for session ${sessionId} (last sent ${Math.round((now - last) / 1000)}s ago)`)
+            return true
+        }
+        this.lastPushTime.set(key, now)
+        return false
     }
 
     /**
@@ -204,7 +236,12 @@ export class PushNotificationClient {
      */
     sendToAllDevices(title: string, body?: string, data?: Record<string, any>): void {
         logger.debug(`[PUSH] sendToAllDevices called with title: "${title}", body: "${body ?? ''}"`);
-        
+
+        const sessionId = typeof data?.sessionId === 'string' ? data.sessionId : null
+        if (sessionId && typeof data?.kind === 'string' && this.shouldSuppressPush(sessionId, data.kind)) {
+            return
+        }
+
         // Execute async operations without awaiting
         (async () => {
             try {
@@ -235,7 +272,8 @@ export class PushNotificationClient {
                         // Bundled app asset paths / require(...) / local file paths will not work in push payloads.
                         // iOS also needs a Notification Service Extension to render richContent.image reliably.
                         sound: 'default',
-                        priority: 'high'
+                        priority: 'high',
+                        channelId: 'messages',
                     }
                 })
 
@@ -274,6 +312,10 @@ export class PushNotificationClient {
         if (!sessionId) {
             logger.debug('[PUSH] sendSessionNotification: missing sessionId, falling back to direct send')
             this.sendToAllDevices(title, body, payloadData)
+            return
+        }
+
+        if (this.shouldSuppressPush(sessionId, params.kind)) {
             return
         }
 

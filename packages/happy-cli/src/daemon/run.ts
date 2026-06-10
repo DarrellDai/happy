@@ -51,6 +51,16 @@ export const initialMachineMetadata: MachineMetadata = {
 };
 
 export async function startDaemon(): Promise<void> {
+  // Strip shell HTTP proxy vars so axios doesn't route Happy's API calls
+  // through a corporate proxy. Happy uses HAPPY_WS_PROXY exclusively for
+  // WebSocket tunnelling; a system HTTPS_PROXY would intercept every axios
+  // request and cause "Invalid header received from client" failures on
+  // proxies that don't forward to api.cluster-fluster.com correctly.
+  delete process.env.HTTP_PROXY
+  delete process.env.http_proxy
+  delete process.env.HTTPS_PROXY
+  delete process.env.https_proxy
+
   // We don't have cleanup function at the time of server construction
   // Control flow is:
   // 1. Create promise that will resolve when shutdown is requested

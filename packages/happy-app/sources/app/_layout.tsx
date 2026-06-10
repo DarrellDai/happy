@@ -361,6 +361,11 @@ export default function RootLayout() {
             })();
             console.log(`[PUSH ROUTING] Queuing navigation to session: ${sessionId}`);
             setPendingSessionId(sessionId);
+            // User tapped a notification — clear the tray so the Android
+            // 50-notification cap resets and future pushes aren't dropped.
+            if (Platform.OS === 'android') {
+                void Notifications.dismissAllNotificationsAsync().catch(() => {});
+            }
         } finally {
             try {
                 await Notifications.clearLastNotificationResponseAsync();
@@ -397,6 +402,40 @@ export default function RootLayout() {
         };
     }, [handleNotificationResponse, initState]);
 
+
+    // On Android, when the app comes to foreground, collapse the tray: keep
+    // only the newest notification per session and dismiss the rest. This
+    // prevents per-session duplicate accumulation from filling the OS 50-cap.
+    // We don't dismiss all (the user didn't ask for that); we just dedup.
+    React.useEffect(() => {
+        if (Platform.OS !== 'android') return;
+        const subscription = AppState.addEventListener('change', async (nextState) => {
+            if (nextState !== 'active') return;
+            try {
+                const presented = await Notifications.getPresentedNotificationsAsync();
+                // Find the identifier of the most-recently-arrived notification per session.
+                const newest = new Map<string, string>(); // sessionId → identifier
+                for (const n of presented) {
+                    const sid = n.request.content.data?.sessionId;
+                    if (typeof sid === 'string') {
+                        // getPresentedNotificationsAsync returns them in delivery order;
+                        // overwrite so the last entry wins (= newest).
+                        newest.set(sid, n.request.identifier);
+                    }
+                }
+                // Dismiss every older duplicate (same session, not the newest).
+                for (const n of presented) {
+                    const sid = n.request.content.data?.sessionId;
+                    if (typeof sid === 'string' && newest.get(sid) !== n.request.identifier) {
+                        void Notifications.dismissNotificationAsync(n.request.identifier).catch(() => {});
+                    }
+                }
+            } catch {
+                // never throw from a background AppState listener
+            }
+        });
+        return () => subscription.remove();
+    }, []);
 
     // Track the screens
     useTrackScreens()
