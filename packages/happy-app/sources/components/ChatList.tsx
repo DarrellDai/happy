@@ -1,7 +1,7 @@
 import * as React from 'react';
 import { useSession, useSessionMessages, useSetting } from "@/sync/storage";
 import { sync } from '@/sync/sync';
-import { ActivityIndicator, FlatList, NativeScrollEvent, NativeSyntheticEvent, Platform, Pressable, View } from 'react-native';
+import { ActivityIndicator, FlatList, NativeScrollEvent, NativeSyntheticEvent, Platform, Pressable, RefreshControl, View } from 'react-native';
 import { useCallback } from 'react';
 import { useHeaderHeight } from '@/utils/responsive';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -68,11 +68,19 @@ const ChatListInternal = React.memo((props: {
     const { theme } = useUnistyles();
     const flatListRef = React.useRef<FlatList>(null);
     const [showScrollButton, setShowScrollButton] = React.useState(false);
-    // Tracks whether the scroll-button is currently shown, so we only call
-    // setShowScrollButton when the threshold is actually crossed instead of
-    // on every scroll frame (60Hz). Without this guard, the entire list
-    // parent re-renders on every wheel tick.
     const showScrollButtonRef = React.useRef(false);
+    const [refreshing, setRefreshing] = React.useState(false);
+
+    const handleRefresh = React.useCallback(async () => {
+        setRefreshing(true);
+        try {
+            sync.onSessionVisible(props.sessionId);
+            // Brief delay so the spinner is visible and the fetch has time to start
+            await new Promise<void>((resolve) => setTimeout(resolve, 800));
+        } finally {
+            setRefreshing(false);
+        }
+    }, [props.sessionId]);
 
     // Group consecutive tool calls between text messages into collapsible
     // containers — unless the user disabled it in settings.
@@ -230,6 +238,9 @@ const ChatListInternal = React.memo((props: {
                 ListFooterComponent={<ListHeader isLoadingOlder={props.isLoadingOlder} />}
                 onEndReached={handleLoadOlder}
                 onEndReachedThreshold={0.5}
+                refreshControl={Platform.OS !== 'web' ? (
+                    <RefreshControl refreshing={refreshing} onRefresh={handleRefresh} />
+                ) : undefined}
             />
             {showScrollButton && (
                 <View style={styles.scrollButtonContainer}>
