@@ -100,6 +100,8 @@ export class ApiSessionClient extends EventEmitter {
     private encryptionKey: Uint8Array;
     private encryptionVariant: 'legacy' | 'dataKey';
     private reconnectInterval: NodeJS.Timeout | null = null;
+    private pollInterval: NodeJS.Timeout | null = null;
+    private lastSocketEventAt = 0;
     private ignoreArchiveSignal = false;
     private skipInitialMessages = false;
     private claudeSessionProtocolState: ClaudeSessionProtocolState = {
@@ -177,6 +179,8 @@ export class ApiSessionClient extends EventEmitter {
                 this.reconnectInterval = null;
             }
             this.rpcHandlerManager.onSocketConnect(this.socket);
+            this.lastSocketEventAt = Date.now();
+            this.startPollInterval();
             this.receiveSync.invalidate();
         })
 
@@ -188,6 +192,10 @@ export class ApiSessionClient extends EventEmitter {
         this.socket.on('disconnect', (reason) => {
             logger.debug(`[API] Socket disconnected: ${reason}`);
             this.rpcHandlerManager.onSocketDisconnect();
+            if (this.pollInterval) {
+                clearInterval(this.pollInterval);
+                this.pollInterval = null;
+            }
             this.startSmartReconnect();
         })
 
@@ -200,6 +208,7 @@ export class ApiSessionClient extends EventEmitter {
         // Server events
         this.socket.on('update', (data: Update) => {
             try {
+                this.lastSocketEventAt = Date.now();
                 logger.debugLargeJson('[SOCKET] [UPDATE] Received update:', data);
 
                 if (!data.body) {
@@ -775,7 +784,25 @@ export class ApiSessionClient extends EventEmitter {
             clearInterval(this.reconnectInterval);
             this.reconnectInterval = null;
         }
+        if (this.pollInterval) {
+            clearInterval(this.pollInterval);
+            this.pollInterval = null;
+        }
         this.socket.close();
+    }
+
+    private startPollInterval() {
+        if (this.pollInterval) clearInterval(this.pollInterval);
+        this.pollInterval = setInterval(() => {
+            this.receiveSync.invalidate();
+            // Watchdog: if socket reports connected but server has delivered no
+            // events for 5 minutes, the TCP path through the SOCKS proxy is
+            // half-open. Force a disconnect so startSmartReconnect() can heal it.
+            if (this.socket.connected && this.lastSocketEventAt > 0 && Date.now() - this.lastSocketEventAt > 5 * 60 * 1000) {
+                logger.debug('[API] No socket events for 5 min — forcing reconnect');
+                this.socket.disconnect();
+            }
+        }, 30_000);
     }
 
     private startSmartReconnect() {
