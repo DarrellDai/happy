@@ -85,6 +85,9 @@ export function getClaudeModelModes(): ModelMode[] {
 export function getCodexModelModes(): ModelMode[] {
     return [
         { key: 'default', name: 'default model', description: null },
+        { key: 'gpt-5.6-sol', name: 'gpt-5.6-sol', description: null },
+        { key: 'gpt-5.6-terra', name: 'gpt-5.6-terra', description: null },
+        { key: 'gpt-5.6-luna', name: 'gpt-5.6-luna', description: null },
         { key: 'gpt-5.5', name: 'gpt-5.5', description: null },
         { key: 'gpt-5.4', name: 'gpt-5.4', description: null },
         { key: 'gpt-5.3-codex', name: 'gpt-5.3-codex', description: null },
