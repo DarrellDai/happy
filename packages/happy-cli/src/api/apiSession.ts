@@ -101,6 +101,7 @@ export class ApiSessionClient extends EventEmitter {
     private encryptionVariant: 'legacy' | 'dataKey';
     private reconnectInterval: NodeJS.Timeout | null = null;
     private pollInterval: NodeJS.Timeout | null = null;
+    private closed = false;
     private lastSocketEventAt = 0;
     private ignoreArchiveSignal = false;
     private skipInitialMessages = false;
@@ -192,16 +193,14 @@ export class ApiSessionClient extends EventEmitter {
         this.socket.on('disconnect', (reason) => {
             logger.debug(`[API] Socket disconnected: ${reason}`);
             this.rpcHandlerManager.onSocketDisconnect();
-            if (this.pollInterval) {
-                clearInterval(this.pollInterval);
-                this.pollInterval = null;
-            }
+            this.startPollInterval();
             this.startSmartReconnect();
         })
 
         this.socket.on('connect_error', (error) => {
             logger.debug('[API] Socket connection error:', error);
             this.rpcHandlerManager.onSocketDisconnect();
+            this.startPollInterval();
             this.startSmartReconnect();
         })
 
@@ -271,6 +270,10 @@ export class ApiSessionClient extends EventEmitter {
         // Connect (after short delay to give a time to add handlers)
         //
 
+        // Socket handshakes can take tens of seconds through a proxy. Poll the
+        // messages endpoint while disconnected so a phone takeover does not
+        // have to wait for the WebSocket to recover.
+        this.startPollInterval();
         this.socket.connect();
     }
 
@@ -436,6 +439,9 @@ export class ApiSessionClient extends EventEmitter {
                     maxSeq = message.seq;
                 }
 
+                // The socket may have delivered this message while the GET
+                // was in flight. Do not route the same phone prompt twice.
+                if (message.seq <= this.lastSeq) continue;
                 if (skipRouting) continue;
 
                 if (message.content?.t !== 'encrypted') {
@@ -445,6 +451,7 @@ export class ApiSessionClient extends EventEmitter {
                 try {
                     const body = decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(message.content.c));
                     this.routeIncomingMessage(body);
+                    this.lastSeq = message.seq;
                 } catch (error) {
                     logger.debug('[API] Failed to decrypt fetched message', {
                         sessionId: this.sessionId,
@@ -480,7 +487,7 @@ export class ApiSessionClient extends EventEmitter {
             const batchStart = this.pendingOutbox.length - batchSize;
             const batch = this.pendingOutbox.slice(batchStart);
 
-            const response = await axios.post<V3PostSessionMessagesResponse>(
+            await axios.post<V3PostSessionMessagesResponse>(
                 `${configuration.serverUrl}/v3/sessions/${encodeURIComponent(this.sessionId)}/messages`,
                 {
                     messages: batch
@@ -491,11 +498,9 @@ export class ApiSessionClient extends EventEmitter {
                 }
             );
 
-            const messages = Array.isArray(response.data.messages) ? response.data.messages : [];
-            const maxSeq = messages.reduce((acc, message) => (
-                message.seq > acc ? message.seq : acc
-            ), this.lastSeq);
-            this.lastSeq = maxSeq;
+            // A POST acknowledgement may jump past an unseen phone message
+            // that was assigned an earlier sequence number. Only the socket
+            // receive path or ordered GET catch-up may advance lastSeq.
             this.pendingOutbox.splice(batchStart, batch.length);
         }
     }
@@ -778,6 +783,7 @@ export class ApiSessionClient extends EventEmitter {
 
     async close() {
         logger.debug('[API] socket.close() called');
+        this.closed = true;
         this.sendSync.stop();
         this.receiveSync.stop();
         if (this.reconnectInterval) {
@@ -792,7 +798,9 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private startPollInterval() {
+        if (this.closed) return;
         if (this.pollInterval) clearInterval(this.pollInterval);
+        const intervalMs = this.socket.connected ? 30_000 : 3_000;
         this.pollInterval = setInterval(() => {
             this.receiveSync.invalidate();
             // Watchdog: if socket reports connected but server has delivered no
@@ -802,10 +810,12 @@ export class ApiSessionClient extends EventEmitter {
                 logger.debug('[API] No socket events for 5 min — forcing reconnect');
                 this.socket.disconnect();
             }
-        }, 30_000);
+        }, intervalMs);
+        this.pollInterval.unref?.();
     }
 
     private startSmartReconnect() {
+        if (this.closed) return;
         if (this.reconnectInterval) return;
 
         this.reconnectInterval = setInterval(() => {
@@ -824,7 +834,9 @@ export class ApiSessionClient extends EventEmitter {
 
         if (shouldReconnect()) {
             logger.debug('[API] Network up + lid open — reconnecting in 1s');
-            setTimeout(() => { if (!this.socket.connected) this.socket.connect() }, 1000);
+            setTimeout(() => {
+                if (!this.closed && !this.socket.connected) this.socket.connect();
+            }, 1000).unref?.();
         }
     }
 }

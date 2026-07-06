@@ -7,12 +7,18 @@ const {
     mockWrapForMcpTransport,
     mockSandboxCleanup,
     mockSpawn,
+    mockSignalPosixDescendants,
+    mockSignalProcessIds,
+    mockWaitForProcessIdsToExit,
 } = vi.hoisted(() => ({
     mockExecSync: vi.fn(),
     mockInitializeSandbox: vi.fn(),
     mockWrapForMcpTransport: vi.fn(),
     mockSandboxCleanup: vi.fn(),
     mockSpawn: vi.fn(),
+    mockSignalPosixDescendants: vi.fn(),
+    mockSignalProcessIds: vi.fn(),
+    mockWaitForProcessIdsToExit: vi.fn(),
 }));
 
 vi.mock('node:child_process', () => ({
@@ -35,6 +41,12 @@ vi.mock('@/ui/logger', () => ({
         info: vi.fn(),
         warn: vi.fn(),
     },
+}));
+
+vi.mock('@/utils/processTree', () => ({
+    signalPosixProcessDescendants: mockSignalPosixDescendants,
+    signalProcessIds: mockSignalProcessIds,
+    waitForProcessIdsToExit: mockWaitForProcessIdsToExit,
 }));
 
 vi.mock('../package.json', () => ({
@@ -122,6 +134,8 @@ describe('CodexAppServerClient sandbox integration', () => {
         mockInitializeSandbox.mockResolvedValue(mockSandboxCleanup);
         mockWrapForMcpTransport.mockResolvedValue({ command: 'sh', args: ['-c', 'wrapped codex app-server'] });
         mockSpawn.mockImplementation(() => createMockProcess());
+        mockSignalPosixDescendants.mockReturnValue([]);
+        mockWaitForProcessIdsToExit.mockResolvedValue([]);
     });
 
     afterAll(() => {
@@ -139,7 +153,7 @@ describe('CodexAppServerClient sandbox integration', () => {
         expect(mockWrapForMcpTransport).toHaveBeenCalledWith('codex', ['app-server', '--listen', 'stdio://']);
         expect(mockSpawn).toHaveBeenCalledWith(
             'sh',
-            ['-c', 'wrapped codex app-server'],
+            ['-c', 'exec wrapped codex app-server'],
             expect.objectContaining({
                 env: expect.objectContaining({
                     CODEX_SANDBOX: 'seatbelt',
@@ -183,6 +197,124 @@ describe('CodexAppServerClient sandbox integration', () => {
 
         expect(mockSandboxCleanup).toHaveBeenCalledTimes(1);
         expect(client.sandboxEnabled).toBe(false);
+    });
+
+    it('waits for the app-server process to exit during ownership handoff', async () => {
+        const proc = createMockProcess({ pid: 1401 });
+        proc.kill.mockImplementation((signal: string) => {
+            if (signal === 'SIGTERM') {
+                setTimeout(() => proc.emit('exit', 0, null), 10);
+            }
+            return true;
+        });
+        mockSpawn.mockImplementationOnce(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        await client.connect();
+
+        let settled = false;
+        const disconnect = client.disconnectAndWait(100).then(() => {
+            settled = true;
+        });
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        expect(settled).toBe(false);
+        await disconnect;
+        expect(proc.kill).toHaveBeenCalledWith('SIGTERM');
+    });
+
+    it('force-kills an app-server that does not stop within the handoff timeout', async () => {
+        const proc = createMockProcess({ pid: 1402 });
+        proc.kill.mockImplementation((signal: string) => {
+            if (signal === 'SIGKILL') {
+                setTimeout(() => proc.emit('exit', null, 'SIGKILL'), 0);
+            }
+            return true;
+        });
+        mockSpawn.mockImplementationOnce(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        await client.connect();
+        await client.disconnectAndWait(1);
+
+        expect(proc.kill).toHaveBeenNthCalledWith(1, 'SIGTERM');
+        expect(proc.kill).toHaveBeenNthCalledWith(2, 'SIGKILL');
+        expect(mockSignalPosixDescendants).toHaveBeenNthCalledWith(1, 1402, 'SIGTERM');
+        expect(mockSignalPosixDescendants).toHaveBeenNthCalledWith(2, 1402, 'SIGKILL');
+    });
+
+    it('shares one in-flight process reaper across concurrent handoff callers', async () => {
+        const proc = createMockProcess({ pid: 1405 });
+        mockSpawn.mockImplementationOnce(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        await client.connect();
+
+        const first = client.disconnectAndWait(100);
+        let secondSettled = false;
+        const second = client.disconnectAndWait(100).then(() => {
+            secondSettled = true;
+        });
+        await new Promise((resolve) => setTimeout(resolve, 1));
+
+        expect(secondSettled).toBe(false);
+        expect(proc.kill).toHaveBeenCalledTimes(1);
+        proc.emit('exit', 0, null);
+
+        await Promise.all([first, second]);
+        expect(proc.kill).toHaveBeenCalledWith('SIGTERM');
+    });
+
+    it('reaps a captured tool descendant after the app-server wrapper exits', async () => {
+        const proc = createMockProcess({ pid: 1406 });
+        proc.kill.mockImplementation((signal: string) => {
+            if (signal === 'SIGTERM') setTimeout(() => proc.emit('exit', 0, null), 0);
+            return true;
+        });
+        mockSignalPosixDescendants.mockReturnValueOnce([2401]);
+        mockWaitForProcessIdsToExit
+            .mockResolvedValueOnce([2401])
+            .mockResolvedValueOnce([]);
+        mockSpawn.mockImplementationOnce(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        await client.connect();
+        await client.disconnectAndWait(100);
+
+        expect(mockSignalProcessIds).toHaveBeenCalledWith([2401], 'SIGKILL');
+        expect(mockWaitForProcessIdsToExit).toHaveBeenCalledTimes(2);
+    });
+
+    it('kills the complete Windows shim process tree during handoff', async () => {
+        const platform = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+        try {
+            const proc = createMockProcess({ pid: 1403 });
+            const taskkill = createMockProcess({ pid: 1404 });
+            mockSpawn
+                .mockImplementationOnce(() => proc)
+                .mockImplementationOnce(() => {
+                    setTimeout(() => proc.emit('exit', 0, null), 0);
+                    return taskkill;
+                });
+
+            const { CodexAppServerClient } = await import('./codexAppServerClient');
+            const client = new CodexAppServerClient();
+            await client.connect();
+            await client.disconnectAndWait(100);
+
+            expect(mockSpawn).toHaveBeenNthCalledWith(
+                2,
+                'taskkill',
+                ['/PID', '1403', '/T', '/F'],
+                { stdio: 'ignore', windowsHide: true },
+            );
+            expect(proc.kill).not.toHaveBeenCalled();
+        } finally {
+            platform.mockRestore();
+        }
     });
 
     it('appends rollout log filter to existing RUST_LOG', async () => {
@@ -230,6 +362,8 @@ describe('CodexAppServerClient sandbox integration', () => {
     it('reconnects and resumes the same thread after forced restart timeout', async () => {
         const firstProcessRequests: MockRpcMessage[] = [];
         const secondProcessRequests: MockRpcMessage[] = [];
+        let firstProcessExited = false;
+        let secondProcessSpawnedBeforeExit = false;
         type CapturedEvent = { type: string; [key: string]: unknown };
 
         const proc1 = createMockProcess({
@@ -310,9 +444,22 @@ describe('CodexAppServerClient sandbox integration', () => {
             },
         });
 
+        proc1.kill.mockImplementation((signal: string) => {
+            if (signal === 'SIGTERM') {
+                setTimeout(() => {
+                    firstProcessExited = true;
+                    proc1.emit('exit', 0, null);
+                }, 10);
+            }
+            return true;
+        });
+
         mockSpawn
             .mockImplementationOnce(() => proc1)
-            .mockImplementationOnce(() => proc2);
+            .mockImplementationOnce(() => {
+                secondProcessSpawnedBeforeExit = !firstProcessExited;
+                return proc2;
+            });
 
         const { CodexAppServerClient } = await import('./codexAppServerClient');
         const client = new CodexAppServerClient();
@@ -361,6 +508,7 @@ describe('CodexAppServerClient sandbox integration', () => {
             persistExtendedHistory: true,
         }));
         expect(client.threadId).toBe('thread-1');
+        expect(secondProcessSpawnedBeforeExit).toBe(false);
 
         await expect(client.sendTurnAndWait('follow up after reconnect')).resolves.toEqual({ aborted: false });
 

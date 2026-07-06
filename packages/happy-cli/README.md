@@ -98,13 +98,16 @@ happy connect status
 | Command | Description |
 |---------|-------------|
 | `happy` | Start Claude Code session (default) |
-| `happy codex` | Start Codex mode |
+| `happy codex` | Start Codex locally with mobile handoff |
 | `happy gemini` | Start Gemini CLI session |
 | `happy openclaw` | Start OpenClaw session |
 | `happy acp` | Start any ACP-compatible agent |
 | `happy resume <id>` | Resume a previous session |
 | `happy notify` | Send push notification to your devices |
 | `happy doctor` | Diagnostics & troubleshooting |
+
+Codex starts in its native local TUI when a terminal is attached. Use
+`happy codex --happy-starting-mode remote` to start directly in the phone-controlled layout.
 
 ---
 

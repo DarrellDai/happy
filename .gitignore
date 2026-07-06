@@ -77,5 +77,9 @@ happy-workspaces/
 # third party tools
 .supervibe/
 
+# TUI test cache and traces
+.tui-test/
+tui-traces/
+
 # JetBrains IDEs
 .idea/

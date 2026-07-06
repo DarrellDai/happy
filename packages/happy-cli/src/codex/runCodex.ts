@@ -34,6 +34,12 @@ import { resolveCodexExecutionPolicy } from './executionPolicy';
 import { mapCodexMcpMessageToSessionEnvelopes, mapCodexProcessorMessageToSessionEnvelopes } from './utils/sessionProtocolMapper';
 import { resumeExistingThread } from './resumeExistingThread';
 import { emitReadyIfIdle } from './emitReadyIfIdle';
+import type { CodexStartingMode } from './cliArgs';
+import { launchNativeCodex, type CodexPermissionMode } from './codexLocalLauncher';
+import { resolveCodexStartingMode, resolveCodexSwitchAction } from './modeLoop';
+import { cleanupStdinAfterInk } from '@/utils/terminalStdinCleanup';
+import { createEnvelope } from '@slopus/happy-wire';
+import { normalizeLocalCodexRolloutEvent } from './codexLocalRolloutState';
 
 /**
  * Extracts a human-readable error from a codex task_complete/turn_aborted event.
@@ -58,6 +64,7 @@ export async function runCodex(opts: {
     startedBy?: 'daemon' | 'terminal';
     noSandbox?: boolean;
     resumeThreadId?: string;
+    startingMode?: CodexStartingMode;
 }): Promise<void> {
     // Early check: ensure Codex CLI is installed before proceeding
     try {
@@ -73,6 +80,14 @@ export async function runCodex(opts: {
         console.error('  \x1b[36mhappy claude\x1b[0m\n');
         process.exit(1);
     }
+
+    const hasInteractiveTTY = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+    const canRunLocal = opts.startedBy !== 'daemon' && hasInteractiveTTY;
+    const initialRunMode = resolveCodexStartingMode({
+        startedBy: opts.startedBy,
+        requestedMode: opts.startingMode,
+        hasTTY: hasInteractiveTTY,
+    });
 
     // Use shared PermissionMode type for cross-agent compatibility
     type PermissionMode = import('@/api/types').PermissionMode;
@@ -158,6 +173,10 @@ export async function runCodex(opts: {
     let client!: CodexAppServerClient;
     let reasoningProcessor!: ReasoningProcessor;
     let abortInProgress: Promise<void> | null = null;
+    let bindSessionHandlers: ((targetSession: ApiSessionClient) => void) | null = null;
+    let currentRunMode = initialRunMode;
+    let activeCodexThreadId = opts.resumeThreadId;
+    let thinking = false;
     const { session: initialSession, reconnectionHandle } = setupOfflineReconnection({
         api,
         sessionTag,
@@ -170,6 +189,18 @@ export async function runCodex(opts: {
             if (permissionHandler) {
                 permissionHandler.updateSession(newSession);
             }
+            bindSessionHandlers?.(newSession);
+            newSession.updateAgentState((currentState) => ({
+                ...currentState,
+                controlledByUser: currentRunMode === 'local',
+            }));
+            if (activeCodexThreadId) {
+                newSession.updateMetadata((currentMetadata) => ({
+                    ...currentMetadata,
+                    codexThreadId: activeCodexThreadId,
+                }));
+            }
+            newSession.keepAlive(thinking, currentRunMode);
         }
     });
     session = initialSession;
@@ -217,6 +248,12 @@ export async function runCodex(opts: {
     let currentPermissionMode: import('@/api/types').PermissionMode | undefined = undefined;
     let currentModel: string | undefined = undefined;
     let currentEffort: ReasoningEffort | undefined = undefined;
+    let localHandoff: (() => void) | null = null;
+    let localTerminate: (() => void) | null = null;
+    let localHandoffRequested = false;
+    let localTerminateRequested = false;
+    let switchToLocalRequested = false;
+    let terminating = false;
 
     // Valid Codex permission modes from remote messages. Matches the modes
     // the mobile UI exposes for Codex sessions (see modelModeOptions.ts:
@@ -238,7 +275,11 @@ export async function runCodex(opts: {
         'none', 'minimal', 'low', 'medium', 'high', 'xhigh',
     ];
 
-    session.onUserMessage((message) => {
+    const handleUserMessage: Parameters<ApiSessionClient['onUserMessage']>[0] = (message) => {
+        if (terminating) {
+            logger.debug('[Codex] Ignoring user message while session termination is in progress');
+            return;
+        }
         // Resolve permission mode (validate against Codex-native modes)
         let messagePermissionMode = currentPermissionMode;
         if (message.meta?.permissionMode) {
@@ -291,16 +332,92 @@ export async function runCodex(opts: {
             effort: messageEffort,
         };
         messageQueue.push(message.content.text, enhancedMode);
-    });
-    let thinking = false;
+        if (currentRunMode === 'local' || switchToLocalRequested) {
+            localHandoffRequested = true;
+            localHandoff?.();
+        }
+    };
     let currentTurnId: string | null = null;
     let codexStartedSubagents = new Set<string>();
     let codexActiveSubagents = new Set<string>();
     let codexProviderSubagentToSessionSubagent = new Map<string, string>();
-    session.keepAlive(thinking, 'remote');
+    let pendingLocalTaskStarted: Record<string, unknown> | null = null;
+    let pendingLocalFailure: string | null = null;
+
+    const sendMappedCodexEvent = (msg: Record<string, unknown>): void => {
+        const mapped = mapCodexMcpMessageToSessionEnvelopes(msg, {
+            currentTurnId,
+            startedSubagents: codexStartedSubagents,
+            activeSubagents: codexActiveSubagents,
+            providerSubagentToSessionSubagent: codexProviderSubagentToSessionSubagent,
+        });
+        currentTurnId = mapped.currentTurnId;
+        codexStartedSubagents = mapped.startedSubagents;
+        codexActiveSubagents = mapped.activeSubagents;
+        codexProviderSubagentToSessionSubagent = mapped.providerSubagentToSessionSubagent;
+        for (const envelope of mapped.envelopes) {
+            session.sendSessionProtocolMessage(envelope);
+        }
+    };
+
+    const handleLocalRolloutEvent = (rawMessage: Record<string, unknown>): void => {
+        const normalized = normalizeLocalCodexRolloutEvent(rawMessage, pendingLocalFailure);
+        const msg = normalized.message;
+        pendingLocalFailure = normalized.pendingFailure;
+
+        if (msg.type === 'task_started') {
+            thinking = true;
+            session.keepAlive(true, 'local');
+            pendingLocalTaskStarted = msg;
+            return;
+        }
+
+        if (normalized.visibleError) {
+            session.sendSessionEvent({
+                type: 'message',
+                message: `Codex error: ${normalized.visibleError}`,
+            });
+        }
+
+        if (msg.type === 'task_complete' || msg.type === 'turn_aborted') {
+            thinking = false;
+            session.keepAlive(false, 'local');
+        }
+
+        if (msg.type === 'user_message') {
+            if (typeof msg.message === 'string' && msg.message.length > 0) {
+                session.sendSessionProtocolMessage(createEnvelope('user', { t: 'text', text: msg.message }));
+            }
+            if (pendingLocalTaskStarted) {
+                sendMappedCodexEvent(pendingLocalTaskStarted);
+                pendingLocalTaskStarted = null;
+            }
+            return;
+        }
+
+        if (pendingLocalTaskStarted) {
+            sendMappedCodexEvent(pendingLocalTaskStarted);
+            pendingLocalTaskStarted = null;
+        }
+        // Rollout persistence records command/patch completion but not their
+        // corresponding begin event. Synthesize the start with the same call id
+        // so the phone receives a well-formed tool lifecycle instead of an
+        // orphaned tool-call-end.
+        if (msg.type === 'exec_command_end') {
+            sendMappedCodexEvent({ ...msg, type: 'exec_command_begin' });
+        } else if (msg.type === 'patch_apply_end') {
+            sendMappedCodexEvent({ ...msg, type: 'patch_apply_begin' });
+        }
+        sendMappedCodexEvent(msg);
+    };
+    session.updateAgentState((currentState) => ({
+        ...currentState,
+        controlledByUser: currentRunMode === 'local',
+    }));
+    session.keepAlive(thinking, currentRunMode);
     // Periodic keep-alive; store handle so we can clear on exit
     const keepAliveInterval = setInterval(() => {
-        session.keepAlive(thinking, 'remote');
+        session.keepAlive(thinking, currentRunMode);
     }, 2000);
 
     const sendReady = () => {
@@ -318,6 +435,138 @@ export async function runCodex(opts: {
         } catch (pushError) {
             logger.debug('[Codex] Failed to send ready push', pushError);
         }
+    };
+
+    const launchLocalCodexSession = async (codexThreadId: string | undefined): Promise<
+        | { type: 'exit'; code: number }
+        | { type: 'switch-to-remote' }
+    > => {
+        let exitCode = 0;
+        let switchToRemote = false;
+        try {
+            if (localTerminateRequested) {
+                return { type: 'exit', code: 0 };
+            }
+            if (messageQueue.size() > 0 || localHandoffRequested) {
+                switchToRemote = true;
+                localHandoffRequested = false;
+                currentRunMode = 'remote';
+                session.keepAlive(thinking, 'remote');
+                session.updateAgentState((currentState) => ({
+                    ...currentState,
+                    controlledByUser: false,
+                }));
+                session.sendSessionEvent({ type: 'switch', mode: 'remote' });
+                return { type: 'switch-to-remote' };
+            }
+
+            if (codexThreadId) {
+                session.updateMetadata((currentMetadata) => ({
+                    ...currentMetadata,
+                    codexThreadId,
+                }));
+            }
+
+            const nativePermissionMode = VALID_REMOTE_PERMISSION_MODES.includes(currentPermissionMode as PermissionMode)
+                ? currentPermissionMode as CodexPermissionMode
+                : undefined;
+            const result = await launchNativeCodex({
+                cwd: process.cwd(),
+                codexHomeDir: process.env.CODEX_HOME,
+                codexThreadId,
+                sandboxConfig,
+                model: currentModel,
+                effort: currentEffort,
+                permissionMode: nativePermissionMode,
+                onRolloutEvent: handleLocalRolloutEvent,
+                onThreadIdDiscovered: (threadId) => {
+                    activeCodexThreadId = threadId;
+                    session.updateMetadata((currentMetadata) => ({
+                        ...currentMetadata,
+                        codexThreadId: threadId,
+                    }));
+                },
+                onLocalHandoffReady: (handoff) => {
+                    localHandoff = handoff;
+                    if (localHandoffRequested) {
+                        handoff();
+                    }
+                },
+                onTerminateReady: (terminate) => {
+                    localTerminate = terminate;
+                    if (localTerminateRequested) {
+                        terminate();
+                    }
+                },
+            });
+
+            if (result.codexThreadId) {
+                activeCodexThreadId = result.codexThreadId;
+                session.updateMetadata((currentMetadata) => ({
+                    ...currentMetadata,
+                    codexThreadId: result.codexThreadId,
+                }));
+            }
+
+            // killSession can arrive after native Codex has exited but while
+            // its rollout/sandbox cleanup is still finishing. Termination must
+            // dominate the already-computed handoff result.
+            if (localTerminateRequested) {
+                exitCode = 0;
+                return { type: 'exit', code: 0 };
+            }
+
+            if (result.type === 'switch') {
+                if (pendingLocalTaskStarted) {
+                    sendMappedCodexEvent(pendingLocalTaskStarted);
+                    pendingLocalTaskStarted = null;
+                }
+                if (currentTurnId) {
+                    sendMappedCodexEvent({ type: 'turn_aborted', status: 'cancelled' });
+                }
+                thinking = false;
+                switchToRemote = true;
+                localHandoffRequested = false;
+                currentRunMode = 'remote';
+                activeCodexThreadId = result.codexThreadId ?? activeCodexThreadId;
+                session.keepAlive(thinking, 'remote');
+                session.updateAgentState((currentState) => ({
+                    ...currentState,
+                    controlledByUser: false,
+                }));
+                session.sendSessionEvent({ type: 'switch', mode: 'remote' });
+            } else {
+                exitCode = result.code;
+            }
+        } catch (error) {
+            exitCode = 1;
+            const message = error instanceof Error ? error.message : String(error);
+            session.sendSessionEvent({
+                type: 'message',
+                message: `Codex local launch failed: ${message}`,
+            });
+            logger.warn('[codex]: Local Codex launch failed', error);
+        } finally {
+            if (process.stdin.isTTY) {
+                try { process.stdin.setRawMode(false); } catch { }
+            }
+            try { process.stdin.pause(); } catch { }
+            localHandoff = null;
+            localTerminate = null;
+            if (!switchToRemote) {
+                reconnectionHandle?.cancel();
+                try {
+                    session.sendSessionDeath();
+                    await session.flush();
+                    await session.close();
+                } catch (error) {
+                    logger.debug('[codex]: Error while closing local session', error);
+                }
+                clearInterval(keepAliveInterval);
+            }
+        }
+
+        return switchToRemote ? { type: 'switch-to-remote' } : { type: 'exit', code: exitCode };
     };
 
     // Debug helper: log active handles/requests if DEBUG is enabled
@@ -404,56 +653,163 @@ export async function runCodex(opts: {
         abortInProgress = null;
     }
 
+    const handleSwitchToLocal = async (): Promise<boolean> => {
+        if (terminating) {
+            return false;
+        }
+        if (!canRunLocal) {
+            session.sendSessionEvent({
+                type: 'message',
+                message: 'Local Codex mode requires an interactive terminal and is unavailable for daemon sessions.',
+            });
+            return false;
+        }
+        if (switchToLocalRequested) {
+            return true;
+        }
+        switchToLocalRequested = true;
+        shouldExit = true;
+        await handleAbort();
+        return true;
+    };
+
+    let happyServer: Awaited<ReturnType<typeof startHappyServer>> | null = null;
+
+    const restoreParentTerminal = (): void => {
+        if (process.stdin.isTTY) {
+            try { process.stdin.setRawMode(false); } catch { }
+        }
+        try { process.stdin.pause(); } catch { }
+    };
+
     /**
      * Handles session termination and process exit.
      * This is called when the session needs to be completely killed (not just aborted).
      * Abort stops the current inference but keeps the session alive.
      * Kill terminates the entire process.
      */
-    const handleKillSession = async () => {
-        logger.debug('[Codex] Kill session requested - terminating process');
-        await handleAbort();
-        logger.debug('[Codex] Abort completed, proceeding with termination');
+    let terminationPromise: Promise<void> | null = null;
+    const handleKillSession = (archive: boolean = true): Promise<void> => {
+        if (terminationPromise) {
+            return terminationPromise;
+        }
 
-        try {
-            // Update lifecycle state to archived before closing
-            if (session) {
+        terminating = true;
+        localTerminateRequested = true;
+        shouldExit = true;
+        abortController.abort();
+        terminationPromise = (async () => {
+            logger.debug('[Codex] Kill session requested - terminating process');
+            if (archive) {
                 session.updateMetadata((currentMetadata) => ({
                     ...currentMetadata,
                     lifecycleState: 'archived',
                     lifecycleStateSince: Date.now(),
                     archivedBy: 'cli',
-                    archiveReason: 'User terminated'
+                    archiveReason: 'User terminated',
                 }));
-                
-                // Send session death message
+            }
+
+            if (currentRunMode === 'local') {
+                localTerminate?.();
+                return;
+            }
+
+            // A terminal shutdown must never enter the abort fallback that can
+            // restart app-server. Disconnecting resolves the pending turn.
+            permissionHandler?.abortAll();
+            reasoningProcessor?.abort();
+            localTerminate?.();
+
+            try {
+                let backendShutdownFailed = false;
+                try {
+                    await client?.disconnectAndWait();
+                } catch (e) {
+                    backendShutdownFailed = true;
+                    logger.debug('[Codex] Error disconnecting Codex during termination', e);
+                }
+
+                happyServer?.stop();
                 session.sendSessionDeath();
                 await session.flush();
                 await session.close();
+
+                logger.debug('[Codex] Session termination complete, exiting');
+                restoreParentTerminal();
+                process.exit(backendShutdownFailed ? 1 : 0);
+            } catch (error) {
+                logger.debug('[Codex] Error during session termination:', error);
+                restoreParentTerminal();
+                process.exit(1);
             }
+        })();
 
-            // Force close Codex transport (best-effort) so we don't leave stray processes
-            try {
-                await client.disconnect();
-            } catch (e) {
-                logger.debug('[Codex] Error disconnecting Codex during termination', e);
-            }
-
-            // Stop Happy MCP server
-            happyServer.stop();
-
-            logger.debug('[Codex] Session termination complete, exiting');
-            process.exit(0);
-        } catch (error) {
-            logger.debug('[Codex] Error during session termination:', error);
-            process.exit(1);
-        }
+        return terminationPromise;
     };
 
-    // Register abort handler
-    session.rpcHandlerManager.registerHandler('abort', handleAbort);
+    // In local mode, abort means the phone is taking control. The queued
+    // message (if any) is processed after the native TUI hands the thread back.
+    const handleAbortRequest = async () => {
+        if (terminating) {
+            return;
+        }
+        if (currentRunMode === 'local' || switchToLocalRequested) {
+            localHandoffRequested = true;
+            localHandoff?.();
+            return;
+        }
+        await handleAbort();
+    };
 
-    registerKillSessionHandler(session.rpcHandlerManager, handleKillSession);
+    const handleSwitchRequest = async (request?: { to?: 'remote' | 'local' }): Promise<boolean> => {
+        const action = resolveCodexSwitchAction({
+            currentMode: currentRunMode,
+            targetMode: request?.to,
+            switchToLocalRequested,
+            canRunLocal,
+            terminating,
+        });
+        if (action === 'reject') {
+            return false;
+        }
+        if (action === 'none') {
+            return true;
+        }
+        if (action === 'switch-to-remote') {
+            localHandoffRequested = true;
+            localHandoff?.();
+            return true;
+        }
+        return handleSwitchToLocal();
+    };
+
+    bindSessionHandlers = (targetSession) => {
+        targetSession.onUserMessage(handleUserMessage);
+        targetSession.rpcHandlerManager.registerHandler('abort', handleAbortRequest);
+        targetSession.rpcHandlerManager.registerHandler<{ to?: 'remote' | 'local' }, boolean>('switch', handleSwitchRequest);
+        registerKillSessionHandler(targetSession.rpcHandlerManager, () => handleKillSession(true));
+    };
+    bindSessionHandlers(session);
+
+    const handleSigterm = (): void => {
+        void handleKillSession(false);
+    };
+    process.on('SIGTERM', handleSigterm);
+
+    if (currentRunMode === 'local') {
+        const localResult = await launchLocalCodexSession(activeCodexThreadId);
+        if (localResult.type === 'exit') {
+            process.exit(localResult.code);
+        }
+    }
+
+    while (currentRunMode === 'remote' && !terminating) {
+        shouldExit = false;
+        switchToLocalRequested = false;
+        abortController = new AbortController();
+        let shouldRestartRemote = false;
+        let fatalHandoffError: Error | null = null;
 
     //
     // Initialize Ink UI
@@ -473,7 +829,8 @@ export async function runCodex(opts: {
                 logger.debug('[codex]: Exiting agent via Ctrl-C');
                 shouldExit = true;
                 await handleAbort();
-            }
+            },
+            onSwitchToLocal: handleSwitchToLocal,
         }), {
             exitOnCtrlC: false,
             patchConsole: false
@@ -627,24 +984,12 @@ export async function runCodex(opts: {
         // Convert events into the unified session-protocol envelope stream.
         // Reasoning deltas are handled by ReasoningProcessor to avoid duplicate text output.
         if (msg.type !== 'agent_reasoning_delta' && msg.type !== 'agent_reasoning' && msg.type !== 'agent_reasoning_section_break' && msg.type !== 'turn_diff') {
-            const mapped = mapCodexMcpMessageToSessionEnvelopes(msg, {
-                currentTurnId,
-                startedSubagents: codexStartedSubagents,
-                activeSubagents: codexActiveSubagents,
-                providerSubagentToSessionSubagent: codexProviderSubagentToSessionSubagent,
-            });
-            currentTurnId = mapped.currentTurnId;
-            codexStartedSubagents = mapped.startedSubagents;
-            codexActiveSubagents = mapped.activeSubagents;
-            codexProviderSubagentToSessionSubagent = mapped.providerSubagentToSessionSubagent;
-            for (const envelope of mapped.envelopes) {
-                session.sendSessionProtocolMessage(envelope);
-            }
+            sendMappedCodexEvent(msg);
         }
     });
 
     // Start Happy MCP server (HTTP) and prepare STDIO bridge config for Codex
-    const happyServer = await startHappyServer(session);
+    happyServer = await startHappyServer(session);
     // Launch the bridge via `node <path>` (rather than relying on the .mjs shebang)
     // so it works on Windows, where Windows can't execute shebang scripts directly.
     // codex would otherwise fail to start the MCP server, the change_title tool would
@@ -663,12 +1008,12 @@ export async function runCodex(opts: {
         await client.connect();
         logger.debug('[codex]: client.connect done');
 
-        if (opts.resumeThreadId) {
+        if (activeCodexThreadId) {
             await resumeExistingThread({
                 client,
                 session,
                 messageBuffer,
-                threadId: opts.resumeThreadId,
+                threadId: activeCodexThreadId,
                 cwd: process.cwd(),
                 mcpServers,
             });
@@ -723,6 +1068,7 @@ export async function runCodex(opts: {
                         sandbox: executionPolicy.sandbox,
                         mcpServers,
                     });
+                    activeCodexThreadId = startedThread.threadId;
                     session.updateMetadata((currentMetadata) => ({
                         ...currentMetadata,
                         codexThreadId: startedThread.threadId,
@@ -769,55 +1115,136 @@ export async function runCodex(opts: {
         }
 
     } finally {
-        // Clean up resources when main loop exits
+        const switchingToLocal = switchToLocalRequested && !terminating;
+        let canLaunchLocal = true;
+        // Clean up resources when the remote runner exits. During a handoff,
+        // the Happy session and queue stay alive while only app-server/Ink stop.
         logger.debug('[codex]: Final cleanup start');
         logActiveHandles('cleanup-start');
 
         // Cancel offline reconnection if still running
-        if (reconnectionHandle) {
+        if (reconnectionHandle && !switchingToLocal) {
             logger.debug('[codex]: Cancelling offline reconnection');
             reconnectionHandle.cancel();
         }
 
-        try {
-            logger.debug('[codex]: sendSessionDeath');
-            session.sendSessionDeath();
-            logger.debug('[codex]: flush begin');
-            await session.flush();
-            logger.debug('[codex]: flush done');
-            logger.debug('[codex]: session.close begin');
-            await session.close();
-            logger.debug('[codex]: session.close done');
-        } catch (e) {
-            logger.debug('[codex]: Error while closing session', e);
+        if (!switchingToLocal && !terminating) {
+            try {
+                logger.debug('[codex]: sendSessionDeath');
+                session.sendSessionDeath();
+                logger.debug('[codex]: flush begin');
+                await session.flush();
+                logger.debug('[codex]: flush done');
+                logger.debug('[codex]: session.close begin');
+                await session.close();
+                logger.debug('[codex]: session.close done');
+            } catch (error) {
+                logger.debug('[codex]: Error while closing session', error);
+            }
         }
-        logger.debug('[codex]: client.disconnect begin');
-        await client.disconnect();
-        logger.debug('[codex]: client.disconnect done');
+
+        try {
+            logger.debug('[codex]: client.disconnect begin');
+            await client?.disconnectAndWait();
+            logger.debug('[codex]: client.disconnect done');
+        } catch (error) {
+            logger.debug('[codex]: Error while disconnecting client', error);
+            if (switchingToLocal) {
+                canLaunchLocal = false;
+                fatalHandoffError = error instanceof Error ? error : new Error(String(error));
+                session.sendSessionEvent({
+                    type: 'message',
+                    message: 'Could not switch to local mode because the Codex backend did not stop cleanly.',
+                });
+            }
+        }
+
         // Stop Happy MCP server
         logger.debug('[codex]: happyServer.stop');
-        happyServer.stop();
+        happyServer?.stop();
+        happyServer = null;
 
-        // Clean up ink UI
-        if (process.stdin.isTTY) {
-            logger.debug('[codex]: setRawMode(false)');
-            try { process.stdin.setRawMode(false); } catch { }
-        }
-        // Stop reading from stdin so the process can exit
-        if (hasTTY) {
-            logger.debug('[codex]: stdin.pause()');
-            try { process.stdin.pause(); } catch { }
-        }
-        // Clear periodic keep-alive to avoid keeping event loop alive
-        logger.debug('[codex]: clearInterval(keepAlive)');
-        clearInterval(keepAliveInterval);
         if (inkInstance) {
             logger.debug('[codex]: inkInstance.unmount()');
             inkInstance.unmount();
         }
+
+        if (switchingToLocal) {
+            await cleanupStdinAfterInk({
+                stdin: process.stdin,
+                drainMs: 150,
+                leaveRawMode: canLaunchLocal,
+                onDebug: (event) => {
+                    logger.debug(`[codex]: stdin drain ${event.bytes}B / ${event.chunks} chunk(s)`);
+                },
+            });
+        } else {
+            if (process.stdin.isTTY) {
+                logger.debug('[codex]: setRawMode(false)');
+                try { process.stdin.setRawMode(false); } catch { }
+            }
+            if (hasTTY) {
+                logger.debug('[codex]: stdin.pause()');
+                try { process.stdin.pause(); } catch { }
+            }
+            logger.debug('[codex]: clearInterval(keepAlive)');
+            clearInterval(keepAliveInterval);
+        }
+
         messageBuffer.clear();
 
         logActiveHandles('cleanup-end');
         logger.debug('[codex]: Final cleanup completed');
+
+        const remoteTakeoverPending = localHandoffRequested || messageQueue.size() > 0;
+        if (switchingToLocal && localTerminateRequested && canLaunchLocal && !fatalHandoffError) {
+            const localResult = await launchLocalCodexSession(activeCodexThreadId);
+            process.exit(localResult.type === 'exit' ? localResult.code : 0);
+        } else if (switchingToLocal && canLaunchLocal && !remoteTakeoverPending) {
+            currentRunMode = 'local';
+            session.keepAlive(thinking, 'local');
+            session.updateAgentState((currentState) => ({
+                ...currentState,
+                controlledByUser: true,
+            }));
+            session.sendSessionEvent({ type: 'switch', mode: 'local' });
+            const localResult = await launchLocalCodexSession(activeCodexThreadId);
+            if (localResult.type === 'exit') {
+                process.exit(localResult.code);
+            }
+            shouldRestartRemote = true;
+        } else if (switchingToLocal && !fatalHandoffError) {
+            localHandoffRequested = false;
+            currentRunMode = 'remote';
+            session.keepAlive(thinking, 'remote');
+            session.updateAgentState((currentState) => ({
+                ...currentState,
+                controlledByUser: false,
+            }));
+            shouldRestartRemote = true;
+        } else if (fatalHandoffError) {
+            reconnectionHandle?.cancel();
+            clearInterval(keepAliveInterval);
+            try {
+                session.sendSessionDeath();
+                await session.flush();
+                await session.close();
+            } catch (error) {
+                logger.debug('[codex]: Error closing session after failed backend shutdown', error);
+            }
+        }
     }
+
+        if (terminating) {
+            await terminationPromise;
+            break;
+        }
+        if (fatalHandoffError) {
+            throw fatalHandoffError;
+        }
+        if (!shouldRestartRemote) {
+            break;
+        }
+    }
+    process.removeListener('SIGTERM', handleSigterm);
 }

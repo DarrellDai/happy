@@ -17,6 +17,11 @@ import { execSync, type ChildProcess } from 'node:child_process';
 import { spawn as crossSpawn } from 'cross-spawn';
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline';
 import { logger } from '@/ui/logger';
+import {
+    signalPosixProcessDescendants,
+    signalProcessIds,
+    waitForProcessIdsToExit,
+} from '@/utils/processTree';
 import type {
     InitializeParams,
     NewConversationParams,
@@ -109,6 +114,9 @@ function normalizeRawFileChangeList(changes: unknown): LegacyPatchChanges | unde
 
 export class CodexAppServerClient {
     private process: ChildProcess | null = null;
+    private disconnectWaitPromise: Promise<void> | null = null;
+    private terminalDisconnectRequested = false;
+    private processDescendantPids = new WeakMap<ChildProcess, Set<number>>();
     private readline: ReadlineInterface | null = null;
     private nextId = 1;
     private pending = new Map<number, PendingRequest>();
@@ -399,7 +407,9 @@ export class CodexAppServerClient {
                 this.sandboxCleanup = await initializeSandbox(this.sandboxConfig, process.cwd());
                 const wrapped = await wrapForMcpTransport('codex', ['app-server', '--listen', 'stdio://']);
                 command = wrapped.command;
-                args = wrapped.args;
+                // Replace the transport shell so lifecycle signals target the
+                // sandbox owner instead of leaving it alive as a descendant.
+                args = ['-c', `exec ${wrapped.args[1]}`];
                 this.sandboxEnabled = true;
                 logger.info(`[CodexAppServer] Sandbox enabled`);
             } catch (error) {
@@ -500,21 +510,29 @@ export class CodexAppServerClient {
         this.readline?.close();
         this.readline = null;
 
-        try {
-            proc?.stdin?.end();
-            proc?.kill('SIGTERM');
-        } catch { /* ignore */ }
-
-        // Force kill after 2s (unref so timer doesn't block process exit)
-        if (pid) {
+        // Force kill after 2s (unref so timer doesn't block process exit).
+        // Install exit listeners before SIGTERM so even a very fast exit clears
+        // the timer before the pid could be reused.
+        if (
+            proc &&
+            typeof proc.exitCode !== 'number' &&
+            (proc.signalCode === null || proc.signalCode === undefined)
+        ) {
             const killTimer = setTimeout(() => {
                 try {
-                    process.kill(pid, 0); // check alive
-                    process.kill(pid, 'SIGKILL');
+                    this.terminateProcessTree(proc, 'SIGKILL');
                 } catch { /* already dead */ }
             }, 2000);
             killTimer.unref();
+            const clearKillTimer = (): void => clearTimeout(killTimer);
+            proc.once('exit', clearKillTimer);
+            proc.once('close', clearKillTimer);
         }
+
+        try {
+            proc?.stdin?.end();
+            if (proc) this.terminateProcessTree(proc, 'SIGTERM');
+        } catch { /* ignore */ }
 
         this.process = null;
         this.connected = false;
@@ -547,6 +565,146 @@ export class CodexAppServerClient {
 
     async disconnect(): Promise<void> {
         await this.disconnectInternal();
+    }
+
+    /**
+     * Disconnect and wait until the owned app-server process is fully reaped.
+     * Mode handoff must not resume the same thread in the native TUI while the
+     * previous app-server still owns it.
+     */
+    async disconnectAndWait(
+        timeoutMs: number = 3_000,
+        opts?: { preserveThreadState?: boolean; allowReconnect?: boolean },
+    ): Promise<void> {
+        if (!opts?.allowReconnect) {
+            this.terminalDisconnectRequested = true;
+        }
+        if (this.disconnectWaitPromise) {
+            // A full disconnect is stronger than a state-preserving restart.
+            // Apply it even when this caller joins an existing reaper.
+            if (!opts?.preserveThreadState) {
+                this._threadId = null;
+                this.threadDefaults = null;
+            }
+            return this.disconnectWaitPromise;
+        }
+
+        const operation = this.disconnectAndWaitOnce(timeoutMs, opts);
+        this.disconnectWaitPromise = operation;
+        try {
+            await operation;
+        } finally {
+            if (this.disconnectWaitPromise === operation) {
+                this.disconnectWaitPromise = null;
+            }
+        }
+    }
+
+    private async disconnectAndWaitOnce(
+        timeoutMs: number,
+        opts?: { preserveThreadState?: boolean; allowReconnect?: boolean },
+    ): Promise<void> {
+        const proc = this.process;
+        if (!proc) {
+            await this.disconnectInternal(opts);
+            return;
+        }
+
+        let resolveExit!: () => void;
+        const exited = new Promise<void>((resolve) => {
+            resolveExit = resolve;
+            if (typeof proc.exitCode === 'number' || (proc.signalCode !== null && proc.signalCode !== undefined)) {
+                resolve();
+                return;
+            }
+            proc.once('exit', resolve);
+            proc.once('close', resolve);
+        });
+
+        await this.disconnectInternal(opts);
+
+        const wait = async (ms: number): Promise<boolean> => {
+            let timer: NodeJS.Timeout | null = null;
+            const timedOut = new Promise<boolean>((resolve) => {
+                timer = setTimeout(() => resolve(false), ms);
+            });
+            const didExit = await Promise.race([
+                exited.then(() => true),
+                timedOut,
+            ]);
+            if (timer) clearTimeout(timer);
+            return didExit;
+        };
+
+        if (await wait(timeoutMs)) {
+            await this.ensureProcessDescendantsExited(proc);
+            return;
+        }
+
+        try {
+            this.terminateProcessTree(proc, 'SIGKILL');
+        } catch {
+            // The process may have exited between the timeout and this call.
+        }
+        if (!(await wait(1_000))) {
+            // Release listeners retained by the local promise before failing.
+            resolveExit();
+            throw new Error(`Codex app-server did not exit after ${timeoutMs + 1_000}ms`);
+        }
+        await this.ensureProcessDescendantsExited(proc);
+    }
+
+    private async ensureProcessDescendantsExited(proc: ChildProcess): Promise<void> {
+        const knownDescendants = this.processDescendantPids.get(proc);
+        if (!knownDescendants || knownDescendants.size === 0 || process.platform === 'win32') {
+            return;
+        }
+
+        let remaining = await waitForProcessIdsToExit(knownDescendants, 50);
+        if (remaining.length > 0) {
+            signalProcessIds(remaining, 'SIGKILL');
+            remaining = await waitForProcessIdsToExit(remaining, 1_000);
+        }
+        this.processDescendantPids.delete(proc);
+        if (remaining.length > 0) {
+            throw new Error(`Codex app-server descendants did not exit: ${remaining.join(', ')}`);
+        }
+    }
+
+    private terminateProcessTree(proc: ChildProcess, signal: 'SIGTERM' | 'SIGKILL'): void {
+        if (process.platform !== 'win32') {
+            if (typeof proc.pid === 'number') {
+                const knownDescendants = this.processDescendantPids.get(proc) ?? new Set<number>();
+                for (const pid of signalPosixProcessDescendants(proc.pid, signal)) {
+                    knownDescendants.add(pid);
+                }
+                this.processDescendantPids.set(proc, knownDescendants);
+                if (signal === 'SIGKILL') {
+                    signalProcessIds(knownDescendants, 'SIGKILL');
+                }
+            }
+            proc.kill(signal);
+            return;
+        }
+
+        if (typeof proc.pid !== 'number') {
+            proc.kill(signal);
+            return;
+        }
+
+        // npm-installed Codex resolves through a cmd.exe shim on Windows. Kill
+        // its complete tree so the native app-server cannot survive the shim.
+        try {
+            const killer = crossSpawn('taskkill', ['/PID', String(proc.pid), '/T', '/F'], {
+                stdio: 'ignore',
+                windowsHide: true,
+            });
+            killer.once('error', () => {
+                try { proc.kill('SIGKILL'); } catch { /* already dead */ }
+            });
+        } catch {
+            proc.kill('SIGKILL');
+        }
     }
 
     private buildThreadConfig(mcpServers?: Record<string, unknown>): Record<string, unknown> | null {
@@ -644,9 +802,23 @@ export class CodexAppServerClient {
     }
 
     async reconnectAndResumeThread(): Promise<boolean> {
+        if (this.terminalDisconnectRequested) {
+            return false;
+        }
         const threadId = this._threadId;
-        await this.disconnectInternal({ preserveThreadState: !!threadId });
+        await this.disconnectAndWait(3_000, {
+            preserveThreadState: !!threadId,
+            allowReconnect: true,
+        });
+        if (this.terminalDisconnectRequested) {
+            return false;
+        }
         await this.connect();
+
+        if (this.terminalDisconnectRequested) {
+            await this.disconnectAndWait();
+            return false;
+        }
 
         if (!threadId) {
             return false;

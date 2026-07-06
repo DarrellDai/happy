@@ -23,5 +23,6 @@ export async function handleCodexCommand(args: string[]): Promise<void> {
     startedBy,
     noSandbox: sandboxArgs.noSandbox,
     resumeThreadId: codexArgs.resumeThreadId ?? undefined,
+    startingMode: codexArgs.startingMode,
   })
 }

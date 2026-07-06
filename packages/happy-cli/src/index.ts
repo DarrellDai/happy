@@ -8,6 +8,7 @@
 
 
 import chalk from 'chalk'
+import axios from 'axios'
 import { runClaude, StartOptions } from '@/claude/runClaude'
 import { logger } from './ui/logger'
 import { readCredentials, readSettings } from './persistence'
@@ -34,6 +35,11 @@ import { extractNoSandboxFlag } from './utils/sandboxFlags'
 import { handleResumeCommand } from '@/resume/handleResumeCommand'
 import { ensureDaemonRunning } from './daemon/ensureDaemonRunning'
 import { handleCodexCommand } from './commands/codexCommand'
+
+// Keep Happy control-plane HTTP requests off shell-wide corporate proxies.
+// Directly launched agent subprocesses still inherit those proxy variables,
+// while Happy's WebSocket can opt into tunnelling via HAPPY_WS_PROXY.
+axios.defaults.proxy = false;
 
 
 (async () => {
@@ -677,7 +683,7 @@ ${chalk.bold('Usage:')}
   happy [options]         Start Claude with mobile control
   happy auth              Manage authentication
   happy resume            Resume a previous Happy session by Happy session ID
-  happy codex             Start Codex mode
+  happy codex             Start Codex locally with mobile handoff
   happy gemini            Start Gemini mode (ACP)
   happy acp               Start a generic ACP-compatible agent
   happy connect           Connect AI vendor API keys

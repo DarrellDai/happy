@@ -64,6 +64,7 @@
     "bundle:webapp": "node scripts/bundle-webapp.cjs",
     "build": "shx rm -rf dist && tsc --noEmit && pkgroll",
     "test": "pnpm run build && vitest run",
+    "test:tui": "tsc --noEmit -p tui/tsconfig.json && tui-test",
     "cli:install": "node scripts/install-local.cjs",
     "prepublishOnly": "pnpm test",
     "postinstall": "node scripts/unpack-tools.cjs"
@@ -110,6 +111,7 @@
   },
   "devDependencies": {
     "@eslint/compat": "^1",
+    "@microsoft/tui-test": "0.0.4",
     "@types/inquirer": "^9.0.9",
     "@types/node": ">=20",
     "@types/ws": "^8.18.1",

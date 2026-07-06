@@ -1,6 +1,15 @@
-export function extractCodexResumeFlag(args: string[]): { resumeThreadId: string | null; args: string[] } {
+const CODEX_STARTING_MODES = ['local', 'remote'] as const;
+
+export type CodexStartingMode = typeof CODEX_STARTING_MODES[number];
+
+export function extractCodexResumeFlag(args: string[]): {
+    resumeThreadId: string | null;
+    startingMode?: CodexStartingMode;
+    args: string[];
+} {
     const remainingArgs: string[] = [];
     let resumeThreadId: string | null = null;
+    let startingMode: CodexStartingMode | undefined;
 
     for (let i = 0; i < args.length; i++) {
         const arg = args[i];
@@ -34,11 +43,23 @@ export function extractCodexResumeFlag(args: string[]): { resumeThreadId: string
             continue;
         }
 
+        if (arg === '--happy-starting-mode' || arg.startsWith('--happy-starting-mode=')) {
+            const value = arg.startsWith('--happy-starting-mode=')
+                ? arg.slice('--happy-starting-mode='.length).trim()
+                : args[++i];
+            if (!value || !CODEX_STARTING_MODES.includes(value as CodexStartingMode)) {
+                throw new Error('Codex starting mode must be local or remote: happy codex --happy-starting-mode <local|remote>');
+            }
+            startingMode = value as CodexStartingMode;
+            continue;
+        }
+
         remainingArgs.push(arg);
     }
 
     return {
         resumeThreadId,
+        ...(startingMode ? { startingMode } : {}),
         args: remainingArgs,
     };
 }

@@ -57,6 +57,7 @@ describe('handleCodexCommand', () => {
       startedBy: 'terminal',
       noSandbox: false,
       resumeThreadId: undefined,
+      startingMode: undefined,
     })
     expect(
       mocks.mockEnsureDaemonRunning.mock.invocationCallOrder[0],
@@ -70,6 +71,7 @@ describe('handleCodexCommand', () => {
     })
     mocks.mockExtractCodexResumeFlag.mockReturnValue({
       resumeThreadId: 'thread-123',
+      startingMode: 'remote',
       args: ['--started-by', 'daemon'],
     })
 
@@ -80,6 +82,7 @@ describe('handleCodexCommand', () => {
       startedBy: 'daemon',
       noSandbox: true,
       resumeThreadId: 'thread-123',
+      startingMode: 'remote',
     })
   })
 })

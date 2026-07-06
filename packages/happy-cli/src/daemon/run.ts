@@ -60,6 +60,8 @@ export async function startDaemon(): Promise<void> {
   delete process.env.http_proxy
   delete process.env.HTTPS_PROXY
   delete process.env.https_proxy
+  delete process.env.ALL_PROXY
+  delete process.env.all_proxy
 
   // We don't have cleanup function at the time of server construction
   // Control flow is:

@@ -24,6 +24,30 @@ describe('extractCodexResumeFlag', () => {
         expect(parsed.args).toEqual(['--started-by', 'terminal']);
     });
 
+    it('extracts Codex starting mode in separate and equals forms', () => {
+        expect(extractCodexResumeFlag([
+            '--happy-starting-mode',
+            'remote',
+            '--started-by',
+            'daemon',
+        ])).toEqual({
+            resumeThreadId: null,
+            startingMode: 'remote',
+            args: ['--started-by', 'daemon'],
+        });
+        expect(extractCodexResumeFlag(['--happy-starting-mode=local'])).toEqual({
+            resumeThreadId: null,
+            startingMode: 'local',
+            args: [],
+        });
+    });
+
+    it('rejects an invalid Codex starting mode', () => {
+        expect(() => extractCodexResumeFlag(['--happy-starting-mode', 'sideways'])).toThrow(
+            'Codex starting mode must be local or remote',
+        );
+    });
+
     it('throws when resume flag is missing a thread ID', () => {
         expect(() => extractCodexResumeFlag(['--resume'])).toThrow(
             'Codex resume requires a thread ID: happy codex --resume <thread-id>',

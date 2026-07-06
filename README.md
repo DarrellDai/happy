@@ -54,13 +54,13 @@ happy codex
 
 ## How does it work?
 
-On your computer, run `happy` instead of `claude` or `happy codex` instead of `codex` to start your AI through our wrapper. When you want to control your coding agent from your phone, it restarts the session in remote mode. To switch back to your computer, just press any key on your keyboard.
+On your computer, run `happy` instead of `claude` or `happy codex` instead of `codex` to start your AI through our wrapper. Interactive sessions start in the native local TUI. When your phone takes over, Happy hands the same session to remote mode. In the remote layout, press Space twice (or Ctrl-T) to resume it locally.
 
 ## 🔥 Why Happy Coder?
 
 - 📱 **Mobile access to Claude Code and Codex** - Check what your AI is building while away from your desk
 - 🔔 **Push notifications** - Get alerted when Claude Code and Codex needs permission or encounters errors  
-- ⚡ **Switch devices instantly** - Take control from phone or desktop with one keypress
+- ⚡ **Switch devices instantly** - Keep the same session when taking control from phone or desktop
 - 🔐 **End-to-end encrypted** - Your code never leaves your devices unencrypted
 - 🛠️ **Open source** - Audit the code yourself. No telemetry, no tracking
 
