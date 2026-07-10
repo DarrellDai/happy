@@ -139,10 +139,10 @@ export function buildCodexNativeArgs(opts: {
             args.push('--ask-for-approval', 'never', '--sandbox', 'read-only');
             break;
         case 'safe-yolo':
-            args.push('--ask-for-approval', 'on-failure', '--sandbox', 'workspace-write');
+            args.push('--ask-for-approval', 'never', '--sandbox', 'workspace-write');
             break;
         case 'yolo':
-            args.push('--dangerously-bypass-approvals-and-sandbox');
+            args.push('--ask-for-approval', 'never', '--sandbox', 'danger-full-access');
             break;
     }
 
@@ -158,6 +158,7 @@ export async function launchNativeCodex(opts: {
     effort?: ReasoningEffort;
     permissionMode?: CodexPermissionMode;
     sandboxConfig?: SandboxConfig;
+    sandboxManagedByHappy?: boolean;
     spawn?: SpawnFn;
     initializeSandbox?: InitializeSandboxFn;
     wrapForSandbox?: WrapForSandboxFn;
@@ -295,7 +296,8 @@ export async function launchNativeCodex(opts: {
         let command = 'codex';
         let args = buildCodexNativeArgs({
             ...opts,
-            sandboxManagedByHappy: Boolean(opts.sandboxConfig?.enabled && process.platform !== 'win32'),
+            sandboxManagedByHappy: opts.sandboxManagedByHappy
+                ?? Boolean(opts.sandboxConfig?.enabled && process.platform !== 'win32'),
         });
         if (opts.sandboxConfig?.enabled && process.platform !== 'win32') {
             const initializeSandbox = opts.initializeSandbox ?? defaultInitializeSandbox;

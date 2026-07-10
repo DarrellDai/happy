@@ -3,7 +3,6 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
   mockAuthAndSetupMachineIfNeeded: vi.fn(),
   mockRunCodex: vi.fn(),
-  mockExtractCodexResumeFlag: vi.fn(),
   mockExtractNoSandboxFlag: vi.fn(),
   mockEnsureDaemonRunning: vi.fn(),
 }))
@@ -14,10 +13,6 @@ vi.mock('@/ui/auth', () => ({
 
 vi.mock('@/codex/runCodex', () => ({
   runCodex: mocks.mockRunCodex,
-}))
-
-vi.mock('@/codex/cliArgs', () => ({
-  extractCodexResumeFlag: mocks.mockExtractCodexResumeFlag,
 }))
 
 vi.mock('@/utils/sandboxFlags', () => ({
@@ -40,10 +35,6 @@ describe('handleCodexCommand', () => {
       noSandbox: false,
       args,
     }))
-    mocks.mockExtractCodexResumeFlag.mockImplementation((args: string[]) => ({
-      resumeThreadId: null,
-      args,
-    }))
     mocks.mockEnsureDaemonRunning.mockResolvedValue(undefined)
     mocks.mockRunCodex.mockResolvedValue(undefined)
   })
@@ -58,6 +49,7 @@ describe('handleCodexCommand', () => {
       noSandbox: false,
       resumeThreadId: undefined,
       startingMode: undefined,
+      permissionMode: undefined,
     })
     expect(
       mocks.mockEnsureDaemonRunning.mock.invocationCallOrder[0],
@@ -67,15 +59,25 @@ describe('handleCodexCommand', () => {
   it('passes parsed no-sandbox and resume flags through to runCodex', async () => {
     mocks.mockExtractNoSandboxFlag.mockReturnValue({
       noSandbox: true,
-      args: ['--resume', 'thread-123', '--started-by', 'daemon'],
-    })
-    mocks.mockExtractCodexResumeFlag.mockReturnValue({
-      resumeThreadId: 'thread-123',
-      startingMode: 'remote',
-      args: ['--started-by', 'daemon'],
+      args: [
+        '--resume',
+        'thread-123',
+        '--happy-starting-mode',
+        'remote',
+        '--started-by',
+        'daemon',
+      ],
     })
 
-    await handleCodexCommand(['--no-sandbox', '--resume', 'thread-123', '--started-by', 'daemon'])
+    await handleCodexCommand([
+      '--no-sandbox',
+      '--resume',
+      'thread-123',
+      '--happy-starting-mode',
+      'remote',
+      '--started-by',
+      'daemon',
+    ])
 
     expect(mocks.mockRunCodex).toHaveBeenCalledWith({
       credentials: { token: 'token' },
@@ -83,6 +85,27 @@ describe('handleCodexCommand', () => {
       noSandbox: true,
       resumeThreadId: 'thread-123',
       startingMode: 'remote',
+      permissionMode: undefined,
+    })
+  })
+
+  it('passes the parsed initial Codex permission mode through to runCodex', async () => {
+    await handleCodexCommand([
+      '--sandbox',
+      'danger-full-access',
+      '--ask-for-approval',
+      'never',
+      '--started-by',
+      'terminal',
+    ])
+
+    expect(mocks.mockRunCodex).toHaveBeenCalledWith({
+      credentials: { token: 'token' },
+      startedBy: 'terminal',
+      noSandbox: false,
+      resumeThreadId: undefined,
+      startingMode: undefined,
+      permissionMode: 'yolo',
     })
   })
 })

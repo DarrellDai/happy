@@ -26,7 +26,10 @@ describe('buildCodexNativeArgs', () => {
             'gpt-5.5',
             '-c',
             'model_reasoning_effort="medium"',
-            '--dangerously-bypass-approvals-and-sandbox',
+            '--ask-for-approval',
+            'never',
+            '--sandbox',
+            'danger-full-access',
         ]);
     });
 
@@ -43,7 +46,10 @@ describe('buildCodexNativeArgs', () => {
             'gpt-5.5',
             '-c',
             'model_reasoning_effort="medium"',
-            '--dangerously-bypass-approvals-and-sandbox',
+            '--ask-for-approval',
+            'never',
+            '--sandbox',
+            'danger-full-access',
         ]);
     });
 
@@ -94,7 +100,7 @@ describe('buildCodexNativeArgs', () => {
             permissionMode: 'safe-yolo',
         })).toEqual([
             '--ask-for-approval',
-            'on-failure',
+            'never',
             '--sandbox',
             'workspace-write',
         ]);
@@ -156,7 +162,10 @@ describe('launchNativeCodex', () => {
                 'gpt-5.5',
                 '-c',
                 'model_reasoning_effort="medium"',
-                '--dangerously-bypass-approvals-and-sandbox',
+                '--ask-for-approval',
+                'never',
+                '--sandbox',
+                'danger-full-access',
             ],
             options: expect.objectContaining({
                 cwd: '/tmp/project',
@@ -168,6 +177,43 @@ describe('launchNativeCodex', () => {
                 }),
             }),
         }]);
+    });
+
+    it('keeps Happy-managed sandbox policy on a shared remote TUI without wrapping it', async () => {
+        const spawnCalls: unknown[] = [];
+
+        await launchNativeCodex({
+            cwd: '/tmp/project',
+            codexThreadId: 'thread-shared',
+            remoteEndpoint: 'ws://127.0.0.1:43210',
+            permissionMode: 'read-only',
+            sandboxManagedByHappy: true,
+            spawn: ((command: string, args: string[], options: Record<string, unknown>) => {
+                spawnCalls.push({ command, args, options });
+                return {
+                    once: (event: string, callback: (value: unknown) => void) => {
+                        if (event === 'exit') {
+                            callback(0);
+                        }
+                        return undefined;
+                    },
+                };
+            }) as never,
+        });
+
+        expect(spawnCalls).toEqual([expect.objectContaining({
+            command: 'codex',
+            args: [
+                '--remote',
+                'ws://127.0.0.1:43210',
+                'resume',
+                'thread-shared',
+                '--ask-for-approval',
+                'never',
+                '--sandbox',
+                'danger-full-access',
+            ],
+        })]);
     });
 
     it('returns a discovered Codex thread id for fresh local sessions', async () => {

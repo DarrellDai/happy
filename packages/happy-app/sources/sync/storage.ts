@@ -32,6 +32,7 @@ import { isMutableTool } from "@/components/tools/knownTools";
 import { projectManager } from "./projectManager";
 import { DecryptedArtifact } from "./artifactTypes";
 import { FeedItem } from "./feedTypes";
+import { resolveSessionPermissionMode, setExplicitSessionPermissionMode } from './sessionPermissionMode';
 
 // Debounce timer for realtimeMode changes
 let realtimeModeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -404,7 +405,6 @@ export const storage = create<StorageState>()((set, get) => {
             // Load drafts and permission modes if sessions are empty (initial load)
             const isInitialLoad = Object.keys(state.sessions).length === 0;
             const savedDrafts = isInitialLoad ? sessionDrafts : {};
-            const savedPermissionModes = isInitialLoad ? sessionPermissionModes : {};
             const savedModelModes = isInitialLoad ? sessionModelModes : {};
             const savedEffortLevels = isInitialLoad ? sessionEffortLevels : {};
 
@@ -420,13 +420,17 @@ export const storage = create<StorageState>()((set, get) => {
                 const existingDraft = state.sessions[session.id]?.draft;
                 const savedDraft = savedDrafts[session.id];
                 const existingPermissionMode = state.sessions[session.id]?.permissionMode;
-                const savedPermissionMode = savedPermissionModes[session.id];
-                const defaultPermissionMode: PermissionModeKey = isSandboxEnabled(session.metadata) ? 'bypassPermissions' : 'default';
-                const resolvedPermissionMode: PermissionModeKey =
-                    (existingPermissionMode && existingPermissionMode !== 'default' ? existingPermissionMode : undefined) ||
-                    (savedPermissionMode && savedPermissionMode !== 'default' ? savedPermissionMode : undefined) ||
-                    (session.permissionMode && session.permissionMode !== 'default' ? session.permissionMode : undefined) ||
-                    defaultPermissionMode;
+                const explicitPermissionMode = Object.prototype.hasOwnProperty.call(sessionPermissionModes, session.id)
+                    ? existingPermissionMode ?? sessionPermissionModes[session.id]
+                    : undefined;
+                const metadataPermissionMode = session.metadata?.permissionMode;
+                const resolvedPermissionMode = resolveSessionPermissionMode({
+                    explicitPermissionMode,
+                    metadataPermissionMode,
+                    existingPermissionMode,
+                    incomingPermissionMode: session.permissionMode,
+                    sandboxEnabled: isSandboxEnabled(session.metadata),
+                });
 
                 // Restore model mode / effort level from MMKV on first load — server
                 // does not sync these, and they used to reset on every app restart (#1028).
@@ -723,14 +727,12 @@ export const storage = create<StorageState>()((set, get) => {
 
             // Persist plan mode change
             if (shouldEnterPlanMode) {
-                const allModes: Record<string, string> = {};
-                const currentState = get();
-                Object.entries(currentState.sessions).forEach(([id, sess]) => {
-                    if (sess.permissionMode && sess.permissionMode !== 'default') {
-                        allModes[id] = sess.permissionMode;
-                    }
-                });
-                saveSessionPermissionModes(allModes);
+                sessionPermissionModes = setExplicitSessionPermissionMode(
+                    sessionPermissionModes,
+                    sessionId,
+                    'plan',
+                );
+                saveSessionPermissionModes(sessionPermissionModes);
             }
 
             return { changed: Array.from(changed), hasReadyEvent };
@@ -1039,16 +1041,15 @@ export const storage = create<StorageState>()((set, get) => {
                 }
             };
 
-            // Collect all permission modes for persistence
-            const allModes: Record<string, string> = {};
-            Object.entries(updatedSessions).forEach(([id, sess]) => {
-                if (sess.permissionMode && sess.permissionMode !== 'default') {
-                    allModes[id] = sess.permissionMode;
-                }
-            });
-
-            // Persist permission modes (only non-default values to save space)
-            saveSessionPermissionModes(allModes);
+            // Only this action represents an explicit selector change. Do not
+            // persist derived defaults from unrelated sessions, or they could
+            // override a later CLI-published startup mode.
+            sessionPermissionModes = setExplicitSessionPermissionMode(
+                sessionPermissionModes,
+                sessionId,
+                mode,
+            );
+            saveSessionPermissionModes(sessionPermissionModes);
 
             // No need to rebuild sessionListViewData since permission mode doesn't affect the list display
             return {
@@ -1070,7 +1071,7 @@ export const storage = create<StorageState>()((set, get) => {
             };
 
             // Persist model modes so the selection survives app restart (#1028).
-            // Only non-default values are kept — matches the permissionMode pattern above.
+            // Default model values remain implicit to keep this map compact.
             const allModes: Record<string, string> = {};
             Object.entries(updatedSessions).forEach(([id, sess]) => {
                 if (sess.modelMode && sess.modelMode !== 'default') {
@@ -1222,6 +1223,7 @@ export const storage = create<StorageState>()((set, get) => {
             const modes = loadSessionPermissionModes();
             delete modes[sessionId];
             saveSessionPermissionModes(modes);
+            sessionPermissionModes = modes;
 
             const modelModes = loadSessionModelModes();
             delete modelModes[sessionId];

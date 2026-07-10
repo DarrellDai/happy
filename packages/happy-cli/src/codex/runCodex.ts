@@ -71,6 +71,7 @@ export async function runCodex(opts: {
     noSandbox?: boolean;
     resumeThreadId?: string;
     startingMode?: CodexStartingMode;
+    permissionMode?: CodexPermissionMode;
 }): Promise<void> {
     // Early check: ensure Codex CLI is installed before proceeding
     try {
@@ -147,6 +148,8 @@ export async function runCodex(opts: {
         machineId,
         startedBy: opts.startedBy,
         sandbox: sandboxConfig,
+        dangerouslySkipPermissions: opts.permissionMode === 'yolo',
+        permissionMode: opts.permissionMode,
     });
 
     // Check for session reconnection env vars (set by daemon for resume-in-place)
@@ -254,7 +257,7 @@ export async function runCodex(opts: {
 
     // Track current overrides to apply per message
     // Use shared PermissionMode type from api/types for cross-agent compatibility
-    let currentPermissionMode: import('@/api/types').PermissionMode | undefined = undefined;
+    let currentPermissionMode: import('@/api/types').PermissionMode | undefined = opts.permissionMode;
     let currentModel: string | undefined = undefined;
     let currentEffort: ReasoningEffort | undefined = undefined;
     let localHandoff: (() => void) | null = null;
@@ -301,6 +304,11 @@ export async function runCodex(opts: {
             if (VALID_REMOTE_PERMISSION_MODES.includes(incoming)) {
                 messagePermissionMode = incoming;
                 currentPermissionMode = messagePermissionMode;
+                session.updateMetadata((currentMetadata) => ({
+                    ...currentMetadata,
+                    dangerouslySkipPermissions: currentPermissionMode === 'yolo',
+                    permissionMode: currentPermissionMode,
+                }));
                 logger.debug(`[Codex] Permission mode updated from user message to: ${currentPermissionMode}`);
             } else {
                 logger.debug(`[Codex] Ignoring invalid permission mode from user message: ${String(message.meta.permissionMode)}`);
@@ -587,6 +595,7 @@ export async function runCodex(opts: {
                 // Wrapping the disposable remote TUI again would create a
                 // second sandbox lifecycle around a client that executes no tools.
                 sandboxConfig: useSharedAppServer ? undefined : sandboxConfig,
+                sandboxManagedByHappy: useSharedAppServer ? client.sandboxEnabled : undefined,
                 model: currentModel,
                 effort: currentEffort,
                 permissionMode: nativePermissionMode,

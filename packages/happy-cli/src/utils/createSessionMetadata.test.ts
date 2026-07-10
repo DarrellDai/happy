@@ -71,4 +71,14 @@ describe('createSessionMetadata', () => {
 
         expect(metadata.dangerouslySkipPermissions).toBe(true);
     });
+
+    it('publishes the initial permission mode for remote clients', () => {
+        const { metadata } = createSessionMetadata({
+            flavor: 'codex',
+            machineId: 'machine-6',
+            permissionMode: 'yolo',
+        });
+
+        expect(metadata.permissionMode).toBe('yolo');
+    });
 });

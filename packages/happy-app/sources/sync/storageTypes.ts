@@ -47,6 +47,7 @@ export const MetadataSchema = z.object({
     flavor: z.string().nullish(), // Session flavor/variant identifier
     sandbox: z.any().nullish(), // Sandbox config metadata from CLI (or null when disabled)
     dangerouslySkipPermissions: z.boolean().nullish(), // Claude --dangerously-skip-permissions mode (or null when unknown)
+    permissionMode: z.string().nullish(), // Effective CLI mode used to initialize the remote selector
     lifecycleState: z.string().optional(),
     lifecycleStateSince: z.number().optional(),
     archivedBy: z.string().optional(),

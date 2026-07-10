@@ -1,6 +1,121 @@
 import { describe, expect, it } from 'vitest';
 
-import { extractCodexResumeFlag } from './cliArgs';
+import { extractCodexPermissionFlags, extractCodexResumeFlag } from './cliArgs';
+
+describe('extractCodexPermissionFlags', () => {
+    it('maps never + danger-full-access to Happy yolo mode', () => {
+        expect(extractCodexPermissionFlags([
+            '--sandbox',
+            'danger-full-access',
+            '--ask-for-approval',
+            'never',
+            '--started-by',
+            'terminal',
+        ])).toEqual({
+            permissionMode: 'yolo',
+            args: ['--started-by', 'terminal'],
+        });
+    });
+
+    it('supports equals syntax and short native aliases in either order', () => {
+        expect(extractCodexPermissionFlags([
+            '--ask-for-approval=never',
+            '--sandbox=danger-full-access',
+        ])).toEqual({ permissionMode: 'yolo', args: [] });
+        expect(extractCodexPermissionFlags([
+            '-a',
+            'never',
+            '-s',
+            'read-only',
+        ])).toEqual({ permissionMode: 'read-only', args: [] });
+    });
+
+    it('maps every supported native policy pair', () => {
+        expect(extractCodexPermissionFlags([
+            '--ask-for-approval', 'untrusted', '--sandbox', 'workspace-write',
+        ]).permissionMode).toBe('default');
+        expect(extractCodexPermissionFlags([
+            '--ask-for-approval', 'never', '--sandbox', 'read-only',
+        ]).permissionMode).toBe('read-only');
+        expect(extractCodexPermissionFlags([
+            '--ask-for-approval', 'never', '--sandbox', 'workspace-write',
+        ]).permissionMode).toBe('safe-yolo');
+        expect(extractCodexPermissionFlags([
+            '--ask-for-approval', 'never', '--sandbox', 'danger-full-access',
+        ]).permissionMode).toBe('yolo');
+    });
+
+    it('supports attached short native aliases', () => {
+        expect(extractCodexPermissionFlags([
+            '-a=never',
+            '-s=danger-full-access',
+        ])).toEqual({ permissionMode: 'yolo', args: [] });
+        expect(extractCodexPermissionFlags([
+            '-anever',
+            '-sworkspace-write',
+        ])).toEqual({ permissionMode: 'safe-yolo', args: [] });
+    });
+
+    it('accepts Happy permission mode and Codex bypass forms', () => {
+        expect(extractCodexPermissionFlags(['--permission-mode=yolo'])).toEqual({
+            permissionMode: 'yolo',
+            args: [],
+        });
+        expect(extractCodexPermissionFlags(['--dangerously-bypass-approvals-and-sandbox'])).toEqual({
+            permissionMode: 'yolo',
+            args: [],
+        });
+    });
+
+    it('accepts redundant policy forms only when they agree', () => {
+        expect(extractCodexPermissionFlags([
+            '--permission-mode', 'yolo',
+            '--ask-for-approval', 'never',
+            '--sandbox', 'danger-full-access',
+            '--dangerously-bypass-approvals-and-sandbox',
+        ])).toEqual({ permissionMode: 'yolo', args: [] });
+
+        expect(() => extractCodexPermissionFlags([
+            '--permission-mode', 'default',
+            '--ask-for-approval', 'never',
+            '--sandbox', 'danger-full-access',
+        ])).toThrow('Conflicting Codex permission flags were provided.');
+    });
+
+    it('rejects incomplete and unsupported native policy pairs', () => {
+        expect(() => extractCodexPermissionFlags([
+            '--sandbox', 'danger-full-access',
+        ])).toThrow('requires both --ask-for-approval and --sandbox');
+        expect(() => extractCodexPermissionFlags([
+            '--ask-for-approval', 'on-request',
+            '--sandbox', 'danger-full-access',
+        ])).toThrow('Unsupported Codex policy combination');
+    });
+
+    it('rejects missing, invalid, and duplicate values', () => {
+        expect(() => extractCodexPermissionFlags(['--ask-for-approval'])).toThrow(
+            '--ask-for-approval requires a value.',
+        );
+        expect(() => extractCodexPermissionFlags(['--sandbox='])).toThrow(
+            '--sandbox requires a value.',
+        );
+        expect(() => extractCodexPermissionFlags(['--permission-mode', 'unsafe'])).toThrow(
+            '--permission-mode must be one of',
+        );
+        expect(() => extractCodexPermissionFlags([
+            '--ask-for-approval', 'on-failure', '--sandbox', 'workspace-write',
+        ])).toThrow('--ask-for-approval must be one of');
+        expect(() => extractCodexPermissionFlags([
+            '--permission-mode', 'yolo', '--permission-mode=default',
+        ])).toThrow('--permission-mode can only be provided once.');
+    });
+
+    it('preserves unrelated arguments when no policy is provided', () => {
+        expect(extractCodexPermissionFlags(['--started-by', 'daemon'])).toEqual({
+            args: ['--started-by', 'daemon'],
+        });
+    });
+});
 
 describe('extractCodexResumeFlag', () => {
     it('returns null and preserves args when resume flag is absent', () => {

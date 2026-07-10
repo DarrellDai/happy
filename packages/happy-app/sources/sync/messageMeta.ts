@@ -11,9 +11,9 @@ export function resolveMessageModeMeta(
 ): { permissionMode: PermissionModeKey; model: string | null; effort: string | null } {
     const sandboxEnabled = isSandboxEnabled(session.metadata);
     const permissionMode: PermissionModeKey =
-        session.permissionMode && session.permissionMode !== 'default'
-            ? session.permissionMode
-            : (sandboxEnabled ? 'bypassPermissions' : 'default');
+        session.permissionMode
+        ?? session.metadata?.permissionMode
+        ?? (sandboxEnabled ? 'bypassPermissions' : 'default');
 
     const modelMode = session.modelMode || 'default';
     const model = modelMode !== 'default' ? modelMode : null;

@@ -12,6 +12,7 @@ describe('MetadataSchema', () => {
             lifecycleStateSince: 123,
             archivedBy: 'cli',
             archiveReason: 'User terminated',
+            permissionMode: 'yolo',
         });
 
         expect(metadata.startedBy).toBe('daemon');
@@ -20,5 +21,6 @@ describe('MetadataSchema', () => {
         expect(metadata.lifecycleStateSince).toBe(123);
         expect(metadata.archivedBy).toBe('cli');
         expect(metadata.archiveReason).toBe('User terminated');
+        expect(metadata.permissionMode).toBe('yolo');
     });
 });
