@@ -59,6 +59,13 @@ export type CodexAppServerTransport = 'stdio' | 'websocket';
 
 export type CodexAppServerClientOptions = {
     transport?: CodexAppServerTransport;
+    /**
+     * Whether a root `thread/started` broadcast from another app-server
+     * connection may become this client's active thread. Disable this when a
+     * connection-scoped selector (such as Happy's native-TUI proxy) owns
+     * thread selection.
+     */
+    adoptExternalRootThreads?: boolean;
 };
 
 export type ApprovalHandlingMode = 'active' | 'observer';
@@ -457,7 +464,8 @@ export class CodexAppServerClient {
             const threadId = params?.thread?.id ?? params?.threadId ?? null;
             const parentThreadId = params?.thread?.parentThreadId ?? null;
             if (
-                !this._threadId
+                this.options.adoptExternalRootThreads !== false
+                && !this._threadId
                 && parentThreadId == null
                 && typeof threadId === 'string'
                 && threadId.length > 0
@@ -474,6 +482,16 @@ export class CodexAppServerClient {
         }
 
         const notificationThreadId = params?.threadId ?? params?.thread_id ?? null;
+        if (
+            this.options.adoptExternalRootThreads === false
+            && !this._threadId
+            && typeof notificationThreadId === 'string'
+        ) {
+            logger.debug(
+                `[CodexAppServer] Ignoring ${method} before connection-scoped thread selection (${notificationThreadId})`,
+            );
+            return true;
+        }
         if (
             this._threadId
             && typeof notificationThreadId === 'string'
@@ -1139,12 +1157,6 @@ export class CodexAppServerClient {
             && typeof (turn as { id?: unknown }).id === 'string'
         )) as { id: string } | undefined;
 
-        if (activeTurn) {
-            this._turnId = activeTurn.id;
-            this.markPendingTurnStarted(activeTurn.id);
-            return;
-        }
-
         const completedPreviousTurn = previousTurnId
             ? turns.find((turn) => (
                 turn
@@ -1152,6 +1164,20 @@ export class CodexAppServerClient {
                 && (turn as { id?: unknown }).id === previousTurnId
             )) as { id?: string; status?: string; error?: unknown } | undefined
             : undefined;
+
+        if (activeTurn) {
+            if (completedPreviousTurn?.id && completedPreviousTurn.id !== activeTurn.id) {
+                this.emitRawTurnCompletion(
+                    completedPreviousTurn.id,
+                    completedPreviousTurn.status ?? 'completed',
+                    completedPreviousTurn.error,
+                    'thread snapshot',
+                );
+            }
+            this._turnId = activeTurn.id;
+            this.markPendingTurnStarted(activeTurn.id);
+            return;
+        }
 
         if (completedPreviousTurn?.id) {
             this.emitRawTurnCompletion(
@@ -1168,6 +1194,23 @@ export class CodexAppServerClient {
     }
 
     // ─── Thread management ──────────────────────────────────────
+
+    /**
+     * Adopt a root selected through a connection-scoped transport signal.
+     * This is used for a brand-new TUI thread, which has no persisted rollout
+     * yet and therefore cannot be resumed from a second connection.
+     */
+    adoptThreadSelection(threadId: string, activeTurnId?: string): void {
+        if (!threadId) {
+            throw new Error('Cannot adopt an empty Codex thread id.');
+        }
+        this._threadId = threadId;
+        this._turnId = activeTurnId ?? null;
+        if (activeTurnId) {
+            this.markPendingTurnStarted(activeTurnId);
+        }
+        logger.debug('[CodexAppServer] Adopted connection-scoped thread:', threadId);
+    }
 
     async startThread(opts: {
         model?: string;
@@ -1208,13 +1251,18 @@ export class CodexAppServerClient {
         sandbox?: SandboxMode;
         mcpServers?: Record<string, unknown>;
         emitActiveTurnSnapshot?: boolean;
+        /** Turn observed active by the selecting client before this connection resumed it. */
+        expectedActiveTurnId?: string;
+        /** Runs after a successful server response but before ownership and replayed events change. */
+        beforeEventReplay?: () => void;
     }): Promise<{ threadId: string; model: string }> {
         const threadId = opts?.threadId ?? this._threadId;
         if (!threadId) {
             throw new Error('No thread available to resume.');
         }
 
-        const activeTurnId = this._threadId === threadId ? this._turnId : null;
+        const activeTurnId = opts?.expectedActiveTurnId
+            ?? (this._threadId === threadId ? this._turnId : null);
         const defaults = this.threadDefaults ?? {};
         const params: ResumeConversationParams = {
             threadId,
@@ -1230,7 +1278,12 @@ export class CodexAppServerClient {
         };
 
         const result = await this.request('thread/resume', params) as ResumeConversationResponse;
+        if (result.thread.id !== threadId) {
+            throw new Error(`thread/resume returned ${result.thread.id} while resuming ${threadId}`);
+        }
+        opts?.beforeEventReplay?.();
         this._threadId = result.thread.id;
+        this._turnId = result.thread.id === threadId ? activeTurnId : null;
         this.reconcileTurnStateFromThread(
             result.thread,
             result.thread.id === threadId ? activeTurnId : null,

@@ -752,6 +752,193 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('does not adopt a root thread broadcast when selection is connection-scoped', async () => {
+        const proc = createMockProcess({ pid: 3018 });
+        mockSpawn.mockImplementation(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(undefined, {
+            adoptExternalRootThreads: false,
+        });
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((event) => events.push(event as Record<string, unknown>));
+        await client.connect();
+
+        pushJsonLine(proc.stdout, {
+            method: 'thread/started',
+            params: {
+                thread: {
+                    id: 'unrelated-root',
+                    parentThreadId: null,
+                    path: '/tmp/unrelated-root',
+                },
+            },
+        });
+        pushJsonLine(proc.stdout, {
+            method: 'turn/started',
+            params: {
+                threadId: 'unrelated-root',
+                turn: { id: 'unrelated-turn', status: 'inProgress', items: [] },
+            },
+        });
+        pushJsonLine(proc.stdout, {
+            method: 'turn/completed',
+            params: {
+                threadId: 'unrelated-root',
+                turn: { id: 'unrelated-turn', status: 'completed', error: null },
+            },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        expect(client.threadId).toBeNull();
+        expect(events).toEqual([]);
+
+        client.adoptThreadSelection('selected-root');
+        pushJsonLine(proc.stdout, {
+            method: 'turn/started',
+            params: {
+                threadId: 'selected-root',
+                turn: { id: 'selected-turn', status: 'inProgress', items: [] },
+            },
+        });
+        pushJsonLine(proc.stdout, {
+            method: 'turn/completed',
+            params: {
+                threadId: 'selected-root',
+                turn: { id: 'selected-turn', status: 'completed', error: null },
+            },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(events).toEqual([
+            expect.objectContaining({ type: 'task_started', turn_id: 'selected-turn' }),
+            expect.objectContaining({ type: 'task_complete', turn_id: 'selected-turn' }),
+        ]);
+        await client.disconnect();
+    });
+
+    it('runs resume commit setup before changing ownership or replaying an active turn', async () => {
+        const proc = createMockProcess({
+            pid: 3019,
+            onRequest: (msg, stdout) => {
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: { thread: { id: 'old-root', turns: [] }, model: 'gpt-test' },
+                    }), 0);
+                }
+                if (msg.method === 'thread/resume' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: {
+                            thread: {
+                                id: 'selected-root',
+                                turns: [{
+                                    id: 'selected-turn',
+                                    status: 'inProgress',
+                                    items: [{
+                                        type: 'userMessage',
+                                        id: 'selected-user',
+                                        clientId: null,
+                                        content: [{ type: 'text', text: 'continue', text_elements: [] }],
+                                    }],
+                                }],
+                            },
+                            model: 'gpt-test',
+                        },
+                    }), 0);
+                }
+            },
+        });
+        mockSpawn.mockImplementation(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const order: string[] = [];
+        client.setEventHandler((event) => order.push(String(event.type)));
+        await client.connect();
+        await client.startThread({ approvalPolicy: 'never', sandbox: 'danger-full-access' });
+
+        await client.resumeThread({
+            threadId: 'selected-root',
+            emitActiveTurnSnapshot: true,
+            beforeEventReplay: () => {
+                expect(client.threadId).toBe('old-root');
+                order.push('before-event-replay');
+            },
+        });
+
+        expect(client.threadId).toBe('selected-root');
+        expect(order).toEqual([
+            'before-event-replay',
+            'user_message',
+            'task_started',
+        ]);
+        await client.disconnect();
+    });
+
+    it('emits one completion when a selected active turn finishes during resume', async () => {
+        const proc = createMockProcess({
+            pid: 3020,
+            onRequest: (msg, stdout) => {
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: { thread: { id: 'old-root', turns: [] }, model: 'gpt-test' },
+                    }), 0);
+                }
+                if (msg.method === 'thread/resume' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: {
+                            thread: {
+                                id: 'selected-root',
+                                turns: [{
+                                    id: 'turn-that-finished',
+                                    status: 'completed',
+                                    error: null,
+                                    items: [],
+                                }],
+                            },
+                            model: 'gpt-test',
+                        },
+                    }), 0);
+                }
+            },
+        });
+        mockSpawn.mockImplementation(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((event) => events.push(event as Record<string, unknown>));
+        await client.connect();
+        await client.startThread({ approvalPolicy: 'never', sandbox: 'danger-full-access' });
+
+        await client.resumeThread({
+            threadId: 'selected-root',
+            expectedActiveTurnId: 'turn-that-finished',
+            emitActiveTurnSnapshot: true,
+        });
+        pushJsonLine(proc.stdout, {
+            method: 'turn/completed',
+            params: {
+                threadId: 'selected-root',
+                turn: { id: 'turn-that-finished', status: 'completed', error: null },
+            },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        expect(events.filter((event) => event.type === 'task_complete')).toEqual([
+            expect.objectContaining({
+                type: 'task_complete',
+                turn_id: 'turn-that-finished',
+                status: 'completed',
+            }),
+        ]);
+        expect(client.hasActiveTurn()).toBe(false);
+        await client.disconnect();
+    });
+
     it('maps raw file change items into legacy patch events', async () => {
         const proc = createMockProcess({
             pid: 3003,

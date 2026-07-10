@@ -46,6 +46,10 @@ import { createEnvelope } from '@slopus/happy-wire';
 import { normalizeLocalCodexRolloutEvent } from './codexLocalRolloutState';
 import { LocalTurnCompletionGate } from './localTurnCompletionGate';
 import { sendCodexReadyNotification } from './sendCodexReadyNotification';
+import {
+    startCodexTuiWebSocketProxy,
+    type CodexTuiSelectionMethod,
+} from './codexTuiWebSocketProxy';
 
 /**
  * Extracts a human-readable error from a codex task_complete/turn_aborted event.
@@ -266,9 +270,16 @@ export async function runCodex(opts: {
     let localTerminateRequested = false;
     let switchToLocalRequested = false;
     let terminating = false;
-    let subscribeSharedLocalThread: ((threadId: string) => void) | null = null;
+    let subscribeSharedLocalThread: ((
+        threadId: string,
+        method: CodexTuiSelectionMethod,
+        expectedActiveTurnId?: string,
+    ) => Promise<void>) | null = null;
     if (useSharedAppServer) {
-        client = new CodexAppServerClient(sandboxConfig, { transport: 'websocket' });
+        client = new CodexAppServerClient(sandboxConfig, {
+            transport: 'websocket',
+            adoptExternalRootThreads: false,
+        });
         client.setApprovalHandlingMode(currentRunMode === 'local' ? 'observer' : 'active');
     }
 
@@ -464,26 +475,12 @@ export async function runCodex(opts: {
         emitLocalReady(msg);
     };
 
-    const syncSharedThreadMetadata = (): void => {
-        const sharedThreadId = client.threadId;
-        if (!sharedThreadId || sharedThreadId === activeCodexThreadId) {
-            return;
-        }
-        activeCodexThreadId = sharedThreadId;
-        session.updateMetadata((currentMetadata) => ({
-            ...currentMetadata,
-            codexThreadId: sharedThreadId,
-        }));
-    };
-
     // The shared app-server is the only component that sees local TUI events
     // immediately. A rollout file is written by the app-server process (not by
     // the disposable `codex --remote` TUI), so PID/originator-based rollout
     // discovery cannot reliably attach a tail for a brand-new local thread.
     // Forward the app-server stream while local mode owns the terminal.
     const handleSharedLocalEvent = (msg: Record<string, unknown>): void => {
-        syncSharedThreadMetadata();
-
         const completionDecision = sharedLocalTurnCompletionGate.classify(msg);
         if (!completionDecision.accepted) {
             return;
@@ -493,9 +490,9 @@ export async function runCodex(opts: {
             return;
         }
         if (msg.type === 'thread_active') {
-            if (typeof msg.thread_id === 'string') {
-                subscribeSharedLocalThread?.(msg.thread_id);
-            }
+            // `thread/status/changed` is broadcast server-wide and does not
+            // identify which connected client selected the thread. The native
+            // TUI proxy below provides connection-scoped selection instead.
             return;
         }
 
@@ -528,7 +525,15 @@ export async function runCodex(opts: {
         // Install this before connecting or launching the native TUI. Otherwise
         // all local turns happen while no consumer is attached to the shared
         // app-server event stream and never reach the phone.
-        client.setEventHandler(handleSharedLocalEvent);
+        client.setEventHandler((message) => {
+            try {
+                handleSharedLocalEvent(message);
+            } catch (error) {
+                // A phone/session rendering failure must not make a successful
+                // app-server resume look failed to the selecting TUI.
+                logger.warn('[Codex] Failed to forward a shared local event', error);
+            }
+        });
     }
     session.updateAgentState((currentState) => ({
         ...currentState,
@@ -546,6 +551,47 @@ export async function runCodex(opts: {
         const server = happyServer as HappyServer | null;
         happyServer = null;
         server?.stop();
+    };
+
+    type SharedTuiProxy = Awaited<ReturnType<typeof startCodexTuiWebSocketProxy>>;
+    let sharedTuiProxy: SharedTuiProxy | null = null;
+    const ensureSharedTuiProxyEndpoint = async (): Promise<string> => {
+        if (!useSharedAppServer) {
+            throw new Error('The shared Codex TUI proxy is unavailable without a shared app-server.');
+        }
+        if (sharedTuiProxy) {
+            return sharedTuiProxy.endpoint;
+        }
+        const targetEndpoint = client.remoteEndpoint;
+        if (!targetEndpoint) {
+            throw new Error('The shared Codex app-server has no WebSocket endpoint.');
+        }
+        const threadStartMcpServers = await ensureHappyMcpServers();
+        sharedTuiProxy = await startCodexTuiWebSocketProxy({
+            targetEndpoint,
+            threadStartMcpServers,
+            onThreadSelected: async ({ threadId, method, activeTurnId }) => {
+                const subscribe = subscribeSharedLocalThread;
+                if (!subscribe) {
+                    throw new Error('Happy is not ready to subscribe to a local Codex thread.');
+                }
+                logger.debug(`[Codex] Native TUI selected ${threadId} via ${method}`);
+                await subscribe(threadId, method, activeTurnId);
+            },
+            onError: (error) => {
+                logger.warn('[Codex] Native TUI WebSocket proxy error', error);
+            },
+        });
+        logger.debug(`[Codex] Native TUI proxy listening at ${sharedTuiProxy.endpoint}`);
+        return sharedTuiProxy.endpoint;
+    };
+    const stopSharedTuiProxy = async (): Promise<void> => {
+        const proxy = sharedTuiProxy;
+        sharedTuiProxy = null;
+        if (proxy) {
+            await proxy.close();
+            await proxy.waitForIdle();
+        }
     };
 
     const launchLocalCodexSession = async (codexThreadId: string | undefined): Promise<
@@ -590,7 +636,7 @@ export async function runCodex(opts: {
                 cwd: process.cwd(),
                 codexHomeDir: process.env.CODEX_HOME,
                 codexThreadId,
-                remoteEndpoint: useSharedAppServer ? client.remoteEndpoint ?? undefined : undefined,
+                remoteEndpoint: useSharedAppServer ? await ensureSharedTuiProxyEndpoint() : undefined,
                 // The shared app-server already owns Happy's external sandbox.
                 // Wrapping the disposable remote TUI again would create a
                 // second sandbox lifecycle around a client that executes no tools.
@@ -602,7 +648,7 @@ export async function runCodex(opts: {
                 // Shared mode streams the canonical events directly from the
                 // app-server. Tailing the same rollout would duplicate them.
                 onRolloutEvent: useSharedAppServer ? undefined : handleLocalRolloutEvent,
-                onThreadIdDiscovered: (threadId) => {
+                onThreadIdDiscovered: useSharedAppServer ? undefined : (threadId) => {
                     activeCodexThreadId = threadId;
                     session.updateMetadata((currentMetadata) => ({
                         ...currentMetadata,
@@ -622,8 +668,15 @@ export async function runCodex(opts: {
                     }
                 },
             });
+            // Seal this launch's connection-scoped selector before changing
+            // modes. close() waits for an in-flight selection callback, so a
+            // terminated TUI cannot mutate ownership later in remote mode.
+            if (useSharedAppServer) {
+                await stopSharedTuiProxy();
+            }
+            await sharedLocalSubscriptionPromise;
 
-            if (result.codexThreadId) {
+            if (result.codexThreadId && !useSharedAppServer) {
                 activeCodexThreadId = result.codexThreadId;
                 session.updateMetadata((currentMetadata) => ({
                     ...currentMetadata,
@@ -651,7 +704,9 @@ export async function runCodex(opts: {
                 switchToRemote = true;
                 localHandoffRequested = false;
                 currentRunMode = 'remote';
-                activeCodexThreadId = result.codexThreadId ?? client.threadId ?? activeCodexThreadId;
+                activeCodexThreadId = useSharedAppServer
+                    ? client.threadId ?? activeCodexThreadId
+                    : result.codexThreadId ?? activeCodexThreadId;
                 if (activeCodexThreadId) {
                     session.updateMetadata((currentMetadata) => ({
                         ...currentMetadata,
@@ -685,6 +740,12 @@ export async function runCodex(opts: {
             if (!switchToRemote) {
                 await sharedLocalSubscriptionPromise;
                 reconnectionHandle?.cancel();
+                try {
+                    await stopSharedTuiProxy();
+                } catch (error) {
+                    logger.debug('[codex]: Error while stopping native TUI proxy', error);
+                    exitCode = 1;
+                }
                 try {
                     await client?.disconnectAndWait();
                 } catch (error) {
@@ -829,49 +890,123 @@ export async function runCodex(opts: {
     };
 
     let sharedLocalSubscriptionThreadId: string | null = null;
-    let sharedLocalSubscriptionPromise = Promise.resolve();
-    subscribeSharedLocalThread = (threadId: string): void => {
+    let sharedLocalSubscriptionTargetThreadId: string | null = null;
+    let sharedLocalSubscriptionTargetPromise: Promise<void> | null = null;
+    let sharedLocalSubscriptionPromise: Promise<void> = Promise.resolve();
+    subscribeSharedLocalThread = (
+        threadId: string,
+        method: CodexTuiSelectionMethod,
+        expectedActiveTurnId?: string,
+    ): Promise<void> => {
         if (!useSharedAppServer || sharedLocalSubscriptionThreadId === threadId) {
-            return;
+            return Promise.resolve();
         }
-        sharedLocalSubscriptionThreadId = threadId;
-        sharedLocalSubscriptionPromise = sharedLocalSubscriptionPromise.then(async () => {
+        if (
+            sharedLocalSubscriptionTargetThreadId === threadId
+            && sharedLocalSubscriptionTargetPromise
+        ) {
+            return sharedLocalSubscriptionTargetPromise;
+        }
+
+        const operation = sharedLocalSubscriptionPromise.then(async () => {
+            // A TUI selection response is held by the proxy until this work
+            // finishes, so the selected thread cannot start its first turn
+            // before Happy owns the corresponding app-server subscription.
+            const resetLocalThreadState = (): void => {
+                if (currentTurnId) {
+                    try {
+                        sendMappedCodexEvent({ type: 'turn_aborted', status: 'cancelled' });
+                    } catch (error) {
+                        logger.warn('[Codex] Could not close the previous local turn during thread selection', error);
+                    }
+                }
+                currentTurnId = null;
+                codexStartedSubagents.clear();
+                codexActiveSubagents.clear();
+                codexProviderSubagentToSessionSubagent.clear();
+                pendingLocalTaskStarted = null;
+                pendingLocalFailure = null;
+                sharedLocalTurnCompletionGate.adoptActiveTurn(expectedActiveTurnId ?? null);
+                thinking = false;
+            };
+            const commitLocalThreadState = (): void => {
+                activeCodexThreadId = threadId;
+                sharedLocalSubscriptionThreadId = threadId;
+                thinking = client.hasActiveTurn();
+                try {
+                    session.updateMetadata((currentMetadata) => ({
+                        ...currentMetadata,
+                        codexThreadId: threadId,
+                    }));
+                } catch (error) {
+                    logger.warn(`[Codex] Could not publish selected thread metadata for ${threadId}`, error);
+                }
+                try {
+                    session.keepAlive(thinking, 'local');
+                } catch (error) {
+                    logger.warn(`[Codex] Could not publish selected thread activity for ${threadId}`, error);
+                }
+            };
+
+            if (method === 'thread/start') {
+                // A brand-new thread is not materialized on disk until its
+                // first turn, so a second connection cannot resume it yet.
+                // The proxy-correlated response is authoritative; adopt it
+                // locally before releasing the response to the TUI.
+                resetLocalThreadState();
+                client.adoptThreadSelection(threadId, expectedActiveTurnId);
+                commitLocalThreadState();
+                logger.debug(`[Codex] Happy adopted new local thread ${threadId}`);
+                return;
+            }
+
             const mcpServers = await ensureHappyMcpServers();
             const executionPolicy = resolveCodexExecutionPolicy(
                 currentPermissionMode ?? 'default',
                 client.sandboxEnabled,
             );
-            for (let attempt = 0; ; attempt += 1) {
-                try {
-                    await client.resumeThread({
-                        threadId,
-                        model: currentModel,
-                        cwd: process.cwd(),
-                        approvalPolicy: executionPolicy.approvalPolicy,
-                        sandbox: executionPolicy.sandbox,
-                        mcpServers,
-                        emitActiveTurnSnapshot: true,
-                    });
-                    break;
-                } catch (error) {
-                    const rolloutNotReady = error instanceof CodexRpcError
-                        && error.code === -32600
-                        && error.message.includes('no rollout found');
-                    if (!rolloutNotReady || attempt >= 5) {
-                        throw error;
+            if (client.threadId !== threadId) {
+                for (let attempt = 0; ; attempt += 1) {
+                    try {
+                        await client.resumeThread({
+                            threadId,
+                            model: currentModel,
+                            cwd: process.cwd(),
+                            approvalPolicy: executionPolicy.approvalPolicy,
+                            sandbox: executionPolicy.sandbox,
+                            mcpServers,
+                            emitActiveTurnSnapshot: true,
+                            expectedActiveTurnId,
+                            beforeEventReplay: resetLocalThreadState,
+                        });
+                        break;
+                    } catch (error) {
+                        const rolloutNotReady = error instanceof CodexRpcError
+                            && error.code === -32600
+                            && error.message.includes('no rollout found');
+                        if (!rolloutNotReady || attempt >= 5) {
+                            throw error;
+                        }
+                        await new Promise((resolve) => setTimeout(resolve, 100 + attempt * 100));
                     }
-                    await new Promise((resolve) => setTimeout(resolve, 100 + attempt * 100));
                 }
+            } else {
+                sharedLocalTurnCompletionGate.adoptActiveTurn(client.turnId);
             }
-            activeCodexThreadId = threadId;
-            session.updateMetadata((currentMetadata) => ({
-                ...currentMetadata,
-                codexThreadId: threadId,
-            }));
+            commitLocalThreadState();
             logger.debug(`[Codex] Happy subscribed to active local thread ${threadId}`);
-        }).catch((error) => {
-            if (sharedLocalSubscriptionThreadId === threadId) {
-                sharedLocalSubscriptionThreadId = null;
+        });
+        sharedLocalSubscriptionTargetThreadId = threadId;
+        sharedLocalSubscriptionTargetPromise = operation;
+        sharedLocalSubscriptionPromise = operation.then(() => {
+            if (sharedLocalSubscriptionTargetPromise === operation) {
+                sharedLocalSubscriptionTargetThreadId = null;
+                sharedLocalSubscriptionTargetPromise = null;
+            }
+        }, (error) => {
+            if (sharedLocalSubscriptionTargetPromise === operation) {
+                sharedLocalSubscriptionTargetThreadId = null;
+                sharedLocalSubscriptionTargetPromise = null;
             }
             logger.warn(`[Codex] Could not subscribe to active local thread ${threadId}`, error);
             session.sendSessionEvent({
@@ -879,6 +1014,7 @@ export async function runCodex(opts: {
                 message: 'Happy could not attach to the active local Codex thread; phone updates may be incomplete.',
             });
         });
+        return operation;
     };
 
     const restoreParentTerminal = (): void => {
@@ -929,6 +1065,12 @@ export async function runCodex(opts: {
 
             try {
                 let backendShutdownFailed = false;
+                try {
+                    await stopSharedTuiProxy();
+                } catch (e) {
+                    backendShutdownFailed = true;
+                    logger.debug('[Codex] Error stopping native TUI proxy during termination', e);
+                }
                 try {
                     await client?.disconnectAndWait();
                 } catch (e) {
@@ -1465,6 +1607,13 @@ export async function runCodex(opts: {
 
         const preserveSharedBackend = useSharedAppServer && switchingToLocal;
         if (!preserveSharedBackend) {
+            try {
+                logger.debug('[codex]: native TUI proxy close begin');
+                await stopSharedTuiProxy();
+                logger.debug('[codex]: native TUI proxy close done');
+            } catch (error) {
+                logger.debug('[codex]: Error while stopping native TUI proxy', error);
+            }
             try {
                 logger.debug('[codex]: client.disconnect begin');
                 await client?.disconnectAndWait();
