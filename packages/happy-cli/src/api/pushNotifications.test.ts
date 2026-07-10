@@ -1,10 +1,23 @@
-import { describe, expect, it } from 'vitest';
+import axios from 'axios';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Metadata } from './types';
 import {
     getSessionNotificationBody,
     getSessionNotificationCopy,
     getSessionNotificationTitle,
+    PushNotificationClient,
 } from './pushNotifications';
+
+vi.mock('axios', () => ({
+    default: {
+        get: vi.fn(),
+        post: vi.fn().mockResolvedValue({}),
+    },
+}));
+
+beforeEach(() => {
+    vi.clearAllMocks();
+});
 
 function makeMetadata(overrides: Partial<Metadata> = {}): Metadata {
     return {
@@ -69,6 +82,40 @@ describe('getSessionNotificationCopy', () => {
         expect(getSessionNotificationCopy('done', metadata)).toEqual({
             title: "It's ready!",
             body: 'Fix push notifications',
+        });
+    });
+});
+
+describe('PushNotificationClient notification cooldowns', () => {
+    it('dispatches every done notification for the same session', async () => {
+        const client = new PushNotificationClient('token', 'https://example.test');
+        const notification = {
+            kind: 'done' as const,
+            metadata: makeMetadata(),
+            data: { sessionId: 'session-1' },
+        };
+
+        client.sendSessionNotification(notification);
+        client.sendSessionNotification(notification);
+
+        await vi.waitFor(() => {
+            expect(axios.post).toHaveBeenCalledTimes(2);
+        });
+    });
+
+    it.each(['permission', 'question'] as const)('retains the %s cooldown for the same session', async (kind) => {
+        const client = new PushNotificationClient('token', 'https://example.test');
+        const notification = {
+            kind,
+            metadata: makeMetadata(),
+            data: { sessionId: 'session-1' },
+        };
+
+        client.sendSessionNotification(notification);
+        client.sendSessionNotification(notification);
+
+        await vi.waitFor(() => {
+            expect(axios.post).toHaveBeenCalledTimes(1);
         });
     });
 });

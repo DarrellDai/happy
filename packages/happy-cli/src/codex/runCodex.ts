@@ -40,6 +40,7 @@ import { resolveCodexStartingMode, resolveCodexSwitchAction } from './modeLoop';
 import { cleanupStdinAfterInk } from '@/utils/terminalStdinCleanup';
 import { createEnvelope } from '@slopus/happy-wire';
 import { normalizeLocalCodexRolloutEvent } from './codexLocalRolloutState';
+import { sendCodexReadyNotification } from './sendCodexReadyNotification';
 
 /**
  * Extracts a human-readable error from a codex task_complete/turn_aborted event.
@@ -421,16 +422,18 @@ export async function runCodex(opts: {
     }, 2000);
 
     const sendReady = () => {
-        session.sendSessionEvent({ type: 'ready' });
         try {
-            api.push().sendSessionNotification({
-                kind: 'done',
+            // Use the direct Expo path for Codex completion notifications. It
+            // sends each token separately with high priority and the audible
+            // "AI" Android channel. This path was live-verified as audible on
+            // the device where the production server path arrived silently.
+            sendCodexReadyNotification({
+                sessionId: session.sessionId,
                 metadata: session.getMetadata(),
-                data: {
-                    sessionId: session.sessionId,
-                    type: 'ready',
-                    provider: 'codex',
-                }
+                sendReadyEvent: () => session.sendSessionEvent({ type: 'ready' }),
+                sendToAllDevices: (title, body, data) => {
+                    api.push().sendToAllDevices(title, body, data);
+                },
             });
         } catch (pushError) {
             logger.debug('[Codex] Failed to send ready push', pushError);

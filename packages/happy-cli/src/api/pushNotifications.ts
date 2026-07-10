@@ -72,11 +72,9 @@ export function getSessionNotificationCopy(
 }
 
 // Per-kind minimum gap between successive pushes for the same session.
-// Prevents 30+ parallel sessions from flooding the Android 50-notification
-// hard cap. "done" fires on every Claude turn finish; "permission" and
-// "question" can also fire repeatedly from a busy session.
-const PUSH_DEBOUNCE_MS: Record<string, number> = {
-    done: 3 * 60 * 1000,       // 3 minutes
+// Completion pushes intentionally have no cooldown so every finished turn can
+// notify. Permission and question prompts retain flood protection.
+const PUSH_DEBOUNCE_MS: Readonly<Record<string, number>> = {
     permission: 2 * 60 * 1000, // 2 minutes
     question: 2 * 60 * 1000,   // 2 minutes
 }
