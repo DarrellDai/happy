@@ -1,4 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { WebSocketServer } from 'ws';
 import type { SandboxConfig } from '@/persistence';
 
 const {
@@ -54,7 +55,7 @@ vi.mock('../package.json', () => ({
 }));
 
 type MockRpcMessage = {
-    id?: number;
+    id?: number | string;
     method?: string;
     params?: any;
     result?: any;
@@ -555,7 +556,30 @@ describe('CodexAppServerClient sandbox integration', () => {
                             method: 'turn/started',
                             params: {
                                 threadId: 'thread-raw-1',
-                                turn: { id: 'turn-raw-1', items: [], status: 'inProgress', error: null },
+                                turn: {
+                                    id: 'turn-raw-1',
+                                    items: [{
+                                        type: 'userMessage',
+                                        id: 'user-raw-1',
+                                        clientId: null,
+                                        content: [{ type: 'text', text: 'run pwd', text_elements: [] }],
+                                    }],
+                                    status: 'inProgress',
+                                    error: null,
+                                },
+                            },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'item/started',
+                            params: {
+                                threadId: 'thread-raw-1',
+                                turnId: 'turn-raw-1',
+                                item: {
+                                    type: 'userMessage',
+                                    id: 'user-raw-1',
+                                    clientId: null,
+                                    content: [{ type: 'text', text: 'run pwd', text_elements: [] }],
+                                },
                             },
                         });
                         pushJsonLine(stdout, {
@@ -638,13 +662,93 @@ describe('CodexAppServerClient sandbox integration', () => {
         await expect(client.sendTurnAndWait('run pwd')).resolves.toEqual({ aborted: false });
 
         expect(events).toEqual(expect.arrayContaining([
+            expect.objectContaining({ type: 'user_message', message: 'run pwd', item_id: 'user-raw-1' }),
             expect.objectContaining({ type: 'task_started', turn_id: 'turn-raw-1' }),
             expect.objectContaining({ type: 'exec_command_begin', callId: 'call-1' }),
             expect.objectContaining({ type: 'exec_command_end', callId: 'call-1', output: '/tmp/project\n' }),
             expect.objectContaining({ type: 'agent_message', message: 'done' }),
         ]));
+        expect(events.findIndex((event) => event.type === 'user_message'))
+            .toBeLessThan(events.findIndex((event) => event.type === 'task_started'));
+        expect(events.filter((event) => event.type === 'user_message')).toHaveLength(1);
         expect(events.filter((event) => event.type === 'task_complete')).toHaveLength(1);
 
+        await client.disconnect();
+    });
+
+    it('announces a root thread created by another app-server client', async () => {
+        const proc = createMockProcess({
+            pid: 3007,
+            onRequest: (msg, stdout) => {
+                if (msg.method === 'thread/resume' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: {
+                            thread: {
+                                id: 'thread-from-tui',
+                                turns: [{
+                                    id: 'turn-from-tui',
+                                    status: 'inProgress',
+                                    items: [{
+                                        type: 'userMessage',
+                                        id: 'user-from-tui',
+                                        clientId: null,
+                                        content: [{ type: 'text', text: 'why', text_elements: [] }],
+                                    }],
+                                }],
+                            },
+                            model: 'gpt-test',
+                        },
+                    }), 0);
+                }
+            },
+        });
+        mockSpawn.mockImplementation(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((event) => events.push(event as Record<string, unknown>));
+        await client.connect();
+
+        pushJsonLine(proc.stdout, {
+            method: 'thread/started',
+            params: {
+                thread: {
+                    id: 'thread-from-tui',
+                    parentThreadId: null,
+                    path: '/tmp/thread-from-tui',
+                },
+            },
+        });
+        await waitFor(() => client.threadId === 'thread-from-tui');
+
+        expect(events).toContainEqual({
+            type: 'thread_started',
+            thread_id: 'thread-from-tui',
+        });
+
+        pushJsonLine(proc.stdout, {
+            method: 'thread/status/changed',
+            params: {
+                threadId: 'thread-from-tui',
+                status: { type: 'active', activeFlags: [] },
+            },
+        });
+        await waitFor(() => events.some((event) => event.type === 'thread_active'));
+        expect(events).toContainEqual({
+            type: 'thread_active',
+            thread_id: 'thread-from-tui',
+        });
+
+        await client.resumeThread({
+            threadId: 'thread-from-tui',
+            emitActiveTurnSnapshot: true,
+        });
+        expect(events).toEqual(expect.arrayContaining([
+            expect.objectContaining({ type: 'user_message', message: 'why', item_id: 'user-from-tui' }),
+            expect.objectContaining({ type: 'task_started', turn_id: 'turn-from-tui' }),
+        ]));
         await client.disconnect();
     });
 
@@ -1029,5 +1133,387 @@ describe('CodexAppServerClient sandbox integration', () => {
         ]));
 
         await client.disconnect();
+    });
+
+    it('steers an active turn without interrupting or replacing it', async () => {
+        const requests: MockRpcMessage[] = [];
+        const proc = createMockProcess({
+            pid: 3010,
+            onRequest: (msg, stdout) => {
+                requests.push(msg);
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: {
+                            thread: { id: 'thread-steer', path: '/tmp/thread-steer' },
+                            model: 'gpt-test',
+                            modelProvider: 'openai',
+                            cwd: '/tmp/project',
+                            approvalPolicy: 'never',
+                            sandbox: { type: 'dangerFullAccess' },
+                            reasoningEffort: null,
+                        },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, { id: msg.id, result: { turn: { id: 'turn-steer' } } });
+                        pushJsonLine(stdout, {
+                            method: 'turn/started',
+                            params: { threadId: 'thread-steer', turn: { id: 'turn-steer', status: 'inProgress' } },
+                        });
+                    }, 0);
+                }
+                if (msg.method === 'turn/steer' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: { turnId: 'turn-steer' },
+                    }), 0);
+                }
+            },
+        });
+        mockSpawn.mockImplementation(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        await client.connect();
+        await client.startThread({ approvalPolicy: 'never', sandbox: 'danger-full-access' });
+
+        let originalSettled = false;
+        const originalTurn = client.sendTurnAndWait('original', { turnTimeoutMs: 5_000 }).then((result) => {
+            originalSettled = true;
+            return result;
+        });
+        await waitFor(() => client.turnId === 'turn-steer');
+
+        await expect(client.steerTurn('phone follow-up')).resolves.toEqual({ turnId: 'turn-steer' });
+        expect(requests.find((msg) => msg.method === 'turn/steer')?.params).toEqual({
+            threadId: 'thread-steer',
+            expectedTurnId: 'turn-steer',
+            input: [{ type: 'text', text: 'phone follow-up' }],
+        });
+        expect(requests.some((msg) => msg.method === 'turn/interrupt')).toBe(false);
+        expect(originalSettled).toBe(false);
+
+        pushJsonLine(proc.stdout, {
+            method: 'turn/completed',
+            params: { threadId: 'thread-steer', turn: { id: 'turn-steer', status: 'completed', error: null } },
+        });
+        await expect(originalTurn).resolves.toEqual({ aborted: false });
+        expect(client.hasActiveTurn()).toBe(false);
+        await client.disconnect();
+    });
+
+    it('does not resurrect a turn that completes before the steer response', async () => {
+        const proc = createMockProcess({
+            pid: 3017,
+            onRequest: (msg, stdout) => {
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: { thread: { id: 'thread-fast', path: '/tmp/fast' }, model: 'gpt-test' },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, { id: msg.id, result: { turn: { id: 'turn-fast' } } });
+                        pushJsonLine(stdout, {
+                            method: 'turn/started',
+                            params: { threadId: 'thread-fast', turn: { id: 'turn-fast', status: 'inProgress' } },
+                        });
+                    }, 0);
+                }
+                if (msg.method === 'turn/steer' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            method: 'turn/completed',
+                            params: { threadId: 'thread-fast', turn: { id: 'turn-fast', status: 'completed', error: null } },
+                        });
+                        pushJsonLine(stdout, { id: msg.id, result: { turnId: 'turn-fast' } });
+                    }, 0);
+                }
+            },
+        });
+        mockSpawn.mockImplementation(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        await client.connect();
+        await client.startThread({ approvalPolicy: 'never', sandbox: 'danger-full-access' });
+        const originalTurn = client.sendTurnAndWait('original', { turnTimeoutMs: 5_000 });
+        await waitFor(() => client.turnId === 'turn-fast');
+        await expect(client.steerTurn('fast follow-up')).resolves.toEqual({ turnId: 'turn-fast' });
+        await expect(originalTurn).resolves.toEqual({ aborted: false });
+        expect(client.hasActiveTurn()).toBe(false);
+        await client.disconnect();
+    });
+
+    it('observes local-TUI approvals without racing a response', async () => {
+        const requests: MockRpcMessage[] = [];
+        const approvals: Array<Record<string, unknown>> = [];
+        const proc = createMockProcess({
+            pid: 3011,
+            onRequest: (msg) => requests.push(msg),
+        });
+        mockSpawn.mockImplementation(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        client.setApprovalHandler(async (params) => {
+            approvals.push(params as Record<string, unknown>);
+            return 'approved';
+        });
+        client.setApprovalHandlingMode('observer');
+        await client.connect();
+
+        pushJsonLine(proc.stdout, {
+            id: 88,
+            method: 'item/commandExecution/requestApproval',
+            params: { threadId: 'thread-local', turnId: 'turn-local', itemId: 'call-local', command: 'pwd', cwd: '/tmp' },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(approvals).toHaveLength(0);
+        expect(requests.some((msg) => msg.id === 88 && msg.result)).toBe(false);
+
+        pushJsonLine(proc.stdout, {
+            method: 'serverRequest/resolved',
+            params: { threadId: 'thread-local', requestId: 88 },
+        });
+        client.setApprovalHandlingMode('active');
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(approvals).toHaveLength(0);
+
+        pushJsonLine(proc.stdout, {
+            id: 89,
+            method: 'item/commandExecution/requestApproval',
+            params: { threadId: 'thread-remote', turnId: 'turn-remote', itemId: 'call-remote', command: 'pwd', cwd: '/tmp' },
+        });
+        await waitFor(() => approvals.length === 1);
+        await waitFor(() => requests.some((msg) => msg.id === 89 && msg.result?.decision === 'accept'));
+        await client.disconnect();
+    });
+
+    it('waits for an approval handler before assuming ownership of a deferred request', async () => {
+        const requests: MockRpcMessage[] = [];
+        const approvals: Array<Record<string, unknown>> = [];
+        const proc = createMockProcess({
+            pid: 3013,
+            onRequest: (msg) => requests.push(msg),
+        });
+        mockSpawn.mockImplementation(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        client.setApprovalHandlingMode('observer');
+        await client.connect();
+
+        pushJsonLine(proc.stdout, {
+            id: 'approval-before-handler',
+            method: 'item/commandExecution/requestApproval',
+            params: { threadId: 'thread-local', turnId: 'turn-local', itemId: 'call-local', command: 'pwd', cwd: '/tmp' },
+        });
+        client.setApprovalHandlingMode('active');
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(requests.some((msg) => msg.id === 'approval-before-handler' && msg.result)).toBe(false);
+
+        client.setApprovalHandler(async (params) => {
+            approvals.push(params as Record<string, unknown>);
+            return 'approved';
+        });
+        await waitFor(() => approvals.length === 1);
+        await waitFor(() => requests.some((msg) => msg.id === 'approval-before-handler' && msg.result?.decision === 'accept'));
+        await client.disconnect();
+    });
+
+    it('suppresses a phone approval response resolved by the local TUI', async () => {
+        const requests: MockRpcMessage[] = [];
+        let resolveApproval!: () => void;
+        const approvalGate = new Promise<void>((resolve) => { resolveApproval = resolve; });
+        const proc = createMockProcess({
+            pid: 3014,
+            onRequest: (msg) => requests.push(msg),
+        });
+        mockSpawn.mockImplementation(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        let approvalStarted = false;
+        client.setApprovalHandler(async () => {
+            approvalStarted = true;
+            await approvalGate;
+            return 'approved';
+        });
+        await client.connect();
+
+        pushJsonLine(proc.stdout, {
+            id: 90,
+            method: 'item/commandExecution/requestApproval',
+            params: { threadId: 'thread-root', turnId: 'turn-root', itemId: 'call-root', command: 'pwd', cwd: '/tmp' },
+        });
+        await waitFor(() => approvalStarted);
+        pushJsonLine(proc.stdout, {
+            method: 'serverRequest/resolved',
+            params: { threadId: 'thread-root', requestId: 90 },
+        });
+        resolveApproval();
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(requests.some((msg) => msg.id === 90 && msg.result)).toBe(false);
+        await client.disconnect();
+    });
+
+    it('keeps root turn state while child subagent lifecycle events complete', async () => {
+        const proc = createMockProcess({
+            pid: 3015,
+            onRequest: (msg, stdout) => {
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: { thread: { id: 'thread-root', path: '/tmp/root', turns: [] }, model: 'gpt-test' },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, { id: msg.id, result: { turn: { id: 'turn-root' } } });
+                        pushJsonLine(stdout, {
+                            method: 'turn/started',
+                            params: { threadId: 'thread-root', turn: { id: 'turn-root', status: 'inProgress' } },
+                        });
+                    }, 0);
+                }
+            },
+        });
+        mockSpawn.mockImplementation(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((event) => events.push(event as Record<string, unknown>));
+        await client.connect();
+        await client.startThread({ approvalPolicy: 'never', sandbox: 'danger-full-access' });
+        let rootSettled = false;
+        const rootTurn = client.sendTurnAndWait('delegate', { turnTimeoutMs: 5_000 }).then((result) => {
+            rootSettled = true;
+            return result;
+        });
+        await waitFor(() => client.turnId === 'turn-root');
+
+        pushJsonLine(proc.stdout, {
+            method: 'turn/started',
+            params: { threadId: 'thread-child', turn: { id: 'turn-child', status: 'inProgress' } },
+        });
+        pushJsonLine(proc.stdout, {
+            method: 'item/completed',
+            params: { threadId: 'thread-child', turnId: 'turn-child', item: { type: 'agentMessage', id: 'child-final', text: 'done', phase: 'final_answer' } },
+        });
+        pushJsonLine(proc.stdout, {
+            method: 'thread/status/changed',
+            params: { threadId: 'thread-child', status: { type: 'idle' } },
+        });
+        pushJsonLine(proc.stdout, {
+            method: 'turn/completed',
+            params: { threadId: 'thread-child', turn: { id: 'turn-child', status: 'completed', error: null } },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(client.turnId).toBe('turn-root');
+        expect(rootSettled).toBe(false);
+        expect(events.filter((event) => event.type === 'task_complete')).toHaveLength(0);
+
+        pushJsonLine(proc.stdout, {
+            method: 'turn/completed',
+            params: { threadId: 'thread-root', turn: { id: 'turn-root', status: 'completed', error: null } },
+        });
+        await expect(rootTurn).resolves.toEqual({ aborted: false });
+        expect(events.filter((event) => event.type === 'task_complete')).toHaveLength(1);
+        await client.disconnect();
+    });
+
+    it('does not clear a newer active turn on stale completion', async () => {
+        const proc = createMockProcess({ pid: 3012 });
+        mockSpawn.mockImplementation(() => proc);
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((event) => events.push(event as Record<string, unknown>));
+        await client.connect();
+
+        pushJsonLine(proc.stdout, {
+            method: 'turn/started',
+            params: { threadId: 'thread-race', turn: { id: 'turn-new', status: 'inProgress' } },
+        });
+        await waitFor(() => client.turnId === 'turn-new');
+        pushJsonLine(proc.stdout, {
+            method: 'turn/completed',
+            params: { threadId: 'thread-race', turn: { id: 'turn-old', status: 'completed', error: null } },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(client.turnId).toBe('turn-new');
+        expect(events.filter((event) => event.type === 'task_complete')).toHaveLength(0);
+        await client.disconnect();
+    });
+
+    it('initializes JSON-RPC over WebSocket and reaps the owned host', async () => {
+        let server: WebSocketServer | null = null;
+        const proc = createMockProcess({ pid: 3016 });
+        proc.kill.mockImplementation((signal: string) => {
+            if (signal === 'SIGTERM') {
+                server?.close();
+                setTimeout(() => proc.emit('exit', 0, null), 0);
+            }
+            return true;
+        });
+        mockSpawn.mockImplementationOnce((_command: string, args: string[]) => {
+            const endpoint = new URL(args[2]);
+            server = new WebSocketServer({ host: endpoint.hostname, port: Number(endpoint.port) });
+            server.on('connection', (socket) => {
+                socket.on('message', (data) => {
+                    const message = JSON.parse(data.toString());
+                    if (message.method === 'initialize') {
+                        socket.send(JSON.stringify({ id: message.id, result: { userAgent: 'ws-test' } }));
+                    }
+                });
+            });
+            return proc;
+        });
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(undefined, { transport: 'websocket' });
+        await client.connect();
+        expect(client.remoteEndpoint).toMatch(/^ws:\/\/127\.0\.0\.1:\d+$/);
+        await client.disconnectAndWait(100);
+        expect(proc.kill).toHaveBeenCalledWith('SIGTERM');
+    });
+
+    it('reaps the WebSocket app-server when initialize fails', async () => {
+        let server: WebSocketServer | null = null;
+        const proc = createMockProcess({ pid: 3018 });
+        proc.kill.mockImplementation((signal: string) => {
+            if (signal === 'SIGTERM') {
+                server?.close();
+                setTimeout(() => proc.emit('exit', 1, null), 0);
+            }
+            return true;
+        });
+        mockSpawn.mockImplementationOnce((_command: string, args: string[]) => {
+            const endpoint = new URL(args[2]);
+            server = new WebSocketServer({ host: endpoint.hostname, port: Number(endpoint.port) });
+            server.on('connection', (socket) => {
+                socket.on('message', (data) => {
+                    const message = JSON.parse(data.toString());
+                    if (message.method === 'initialize') {
+                        socket.send(JSON.stringify({
+                            id: message.id,
+                            error: { code: -32600, message: 'initialize rejected' },
+                        }));
+                    }
+                });
+            });
+            return proc;
+        });
+
+        const { CodexAppServerClient, CodexRpcError } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(undefined, { transport: 'websocket' });
+        await expect(client.connect()).rejects.toBeInstanceOf(CodexRpcError);
+        expect(proc.kill).toHaveBeenCalledWith('SIGTERM');
+        expect(client.remoteEndpoint).toBeNull();
     });
 });

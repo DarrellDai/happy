@@ -8,6 +8,7 @@ import type { PermissionMode } from '@/api/types';
 import type { SandboxConfig } from '@/persistence';
 import { initializeSandbox as defaultInitializeSandbox, wrapForMcpTransport } from '@/sandbox/manager';
 import { logger } from '@/ui/logger';
+import { ensureLocalProxyBypass } from '@/claude/utils/proxyBypass';
 import {
     signalPosixProcessDescendants,
     signalProcessIds as defaultSignalProcessIds,
@@ -100,12 +101,17 @@ async function waitForDiscoveredThreadId(opts: {
 
 export function buildCodexNativeArgs(opts: {
     codexThreadId?: string;
+    remoteEndpoint?: string;
     model?: string;
     effort?: ReasoningEffort;
     permissionMode?: CodexPermissionMode;
     sandboxManagedByHappy?: boolean;
 }): string[] {
     const args: string[] = [];
+
+    if (opts.remoteEndpoint) {
+        args.push('--remote', opts.remoteEndpoint);
+    }
 
     if (opts.codexThreadId) {
         args.push('resume', opts.codexThreadId);
@@ -147,6 +153,7 @@ export async function launchNativeCodex(opts: {
     cwd: string;
     codexHomeDir?: string;
     codexThreadId?: string;
+    remoteEndpoint?: string;
     model?: string;
     effort?: ReasoningEffort;
     permissionMode?: CodexPermissionMode;
@@ -321,13 +328,17 @@ export async function launchNativeCodex(opts: {
             }
         }
 
+        const childEnv: Record<string, string | undefined> = {
+            ...process.env,
+            CODEX_INTERNAL_ORIGINATOR_OVERRIDE: originator,
+        };
+        if (opts.remoteEndpoint) {
+            ensureLocalProxyBypass(childEnv);
+        }
         const child = spawn(command, args, {
             cwd: opts.cwd,
             stdio: 'inherit',
-            env: {
-                ...process.env,
-                CODEX_INTERNAL_ORIGINATOR_OVERRIDE: originator,
-            },
+            env: childEnv,
             windowsHide: true,
         });
         let discoveredThreadId = opts.codexThreadId;

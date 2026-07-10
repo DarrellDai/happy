@@ -1,7 +1,11 @@
 import { render } from "ink";
 import React from "react";
 import { ApiClient } from '@/api/api';
-import { CodexAppServerClient } from './codexAppServerClient';
+import {
+    CodexAppServerClient,
+    CodexRpcError,
+    supportsSharedCodexAppServer,
+} from './codexAppServerClient';
 import type { ReasoningEffort } from './codexAppServerTypes';
 import { CodexPermissionHandler } from './utils/permissionHandler';
 import { ReasoningProcessor } from './utils/reasoningProcessor';
@@ -33,13 +37,14 @@ import type { ApiSessionClient } from '@/api/apiSession';
 import { resolveCodexExecutionPolicy } from './executionPolicy';
 import { mapCodexMcpMessageToSessionEnvelopes, mapCodexProcessorMessageToSessionEnvelopes } from './utils/sessionProtocolMapper';
 import { resumeExistingThread } from './resumeExistingThread';
-import { emitReadyIfIdle } from './emitReadyIfIdle';
+import { emitReadyForLocalCompletion, emitReadyIfIdle } from './emitReadyIfIdle';
 import type { CodexStartingMode } from './cliArgs';
 import { launchNativeCodex, type CodexPermissionMode } from './codexLocalLauncher';
 import { resolveCodexStartingMode, resolveCodexSwitchAction } from './modeLoop';
 import { cleanupStdinAfterInk } from '@/utils/terminalStdinCleanup';
 import { createEnvelope } from '@slopus/happy-wire';
 import { normalizeLocalCodexRolloutEvent } from './codexLocalRolloutState';
+import { LocalTurnCompletionGate } from './localTurnCompletionGate';
 import { sendCodexReadyNotification } from './sendCodexReadyNotification';
 
 /**
@@ -120,6 +125,9 @@ export async function runCodex(opts: {
     const settings = await readSettings();
     let machineId = settings?.machineId;
     const sandboxConfig = opts.noSandbox ? undefined : settings?.sandboxConfig;
+    const useSharedAppServer = canRunLocal
+        && (!sandboxConfig?.enabled || sandboxConfig.allowLocalBinding)
+        && supportsSharedCodexAppServer();
     if (!machineId) {
         console.error(`[START] No machine ID found in settings, which is unexpected since authAndSetupMachineIfNeeded should have created it. Please report this issue on https://github.com/slopus/happy-cli/issues`);
         process.exit(1);
@@ -255,6 +263,11 @@ export async function runCodex(opts: {
     let localTerminateRequested = false;
     let switchToLocalRequested = false;
     let terminating = false;
+    let subscribeSharedLocalThread: ((threadId: string) => void) | null = null;
+    if (useSharedAppServer) {
+        client = new CodexAppServerClient(sandboxConfig, { transport: 'websocket' });
+        client.setApprovalHandlingMode(currentRunMode === 'local' ? 'observer' : 'active');
+    }
 
     // Valid Codex permission modes from remote messages. Matches the modes
     // the mobile UI exposes for Codex sessions (see modelModeOptions.ts:
@@ -344,6 +357,36 @@ export async function runCodex(opts: {
     let codexProviderSubagentToSessionSubagent = new Map<string, string>();
     let pendingLocalTaskStarted: Record<string, unknown> | null = null;
     let pendingLocalFailure: string | null = null;
+    const sharedLocalTurnCompletionGate = new LocalTurnCompletionGate();
+
+    const sendReady = () => {
+        try {
+            // Use the direct Expo path for Codex completion notifications. It
+            // sends each token separately with high priority and the audible
+            // "AI" Android channel. This path was live-verified as audible on
+            // the device where the production server path arrived silently.
+            sendCodexReadyNotification({
+                sessionId: session.sessionId,
+                metadata: session.getMetadata(),
+                sendReadyEvent: () => session.sendSessionEvent({ type: 'ready' }),
+                sendToAllDevices: (title, body, data) => {
+                    api.push().sendToAllDevices(title, body, data);
+                },
+            });
+        } catch (pushError) {
+            logger.debug('[Codex] Failed to send ready push', pushError);
+        }
+    };
+
+    const emitLocalReady = (message: Record<string, unknown>): void => {
+        emitReadyForLocalCompletion({
+            message,
+            handoffPending: localHandoffRequested,
+            queueSize: () => messageQueue.size(),
+            shouldExit: terminating || localTerminateRequested,
+            sendReady,
+        });
+    };
 
     const sendMappedCodexEvent = (msg: Record<string, unknown>): void => {
         const mapped = mapCodexMcpMessageToSessionEnvelopes(msg, {
@@ -410,7 +453,75 @@ export async function runCodex(opts: {
             sendMappedCodexEvent({ ...msg, type: 'patch_apply_begin' });
         }
         sendMappedCodexEvent(msg);
+        emitLocalReady(msg);
     };
+
+    const syncSharedThreadMetadata = (): void => {
+        const sharedThreadId = client.threadId;
+        if (!sharedThreadId || sharedThreadId === activeCodexThreadId) {
+            return;
+        }
+        activeCodexThreadId = sharedThreadId;
+        session.updateMetadata((currentMetadata) => ({
+            ...currentMetadata,
+            codexThreadId: sharedThreadId,
+        }));
+    };
+
+    // The shared app-server is the only component that sees local TUI events
+    // immediately. A rollout file is written by the app-server process (not by
+    // the disposable `codex --remote` TUI), so PID/originator-based rollout
+    // discovery cannot reliably attach a tail for a brand-new local thread.
+    // Forward the app-server stream while local mode owns the terminal.
+    const handleSharedLocalEvent = (msg: Record<string, unknown>): void => {
+        syncSharedThreadMetadata();
+
+        const completionDecision = sharedLocalTurnCompletionGate.classify(msg);
+        if (!completionDecision.accepted) {
+            return;
+        }
+
+        if (msg.type === 'thread_started') {
+            return;
+        }
+        if (msg.type === 'thread_active') {
+            if (typeof msg.thread_id === 'string') {
+                subscribeSharedLocalThread?.(msg.thread_id);
+            }
+            return;
+        }
+
+        if (msg.type === 'user_message') {
+            if (typeof msg.message === 'string' && msg.message.length > 0) {
+                session.sendSessionProtocolMessage(createEnvelope('user', { t: 'text', text: msg.message }));
+            }
+            return;
+        }
+
+        if (msg.type === 'task_started') {
+            thinking = true;
+            session.keepAlive(true, 'local');
+        } else if (msg.type === 'task_complete' || msg.type === 'turn_aborted') {
+            thinking = false;
+            session.keepAlive(false, 'local');
+            const failure = describeCodexFailure(msg);
+            if (failure) {
+                session.sendSessionEvent({ type: 'message', message: `Codex error: ${failure}` });
+            }
+        }
+
+        sendMappedCodexEvent(msg);
+        if (completionDecision.successfulCompletion) {
+            emitLocalReady(msg);
+        }
+    };
+
+    if (useSharedAppServer) {
+        // Install this before connecting or launching the native TUI. Otherwise
+        // all local turns happen while no consumer is attached to the shared
+        // app-server event stream and never reach the phone.
+        client.setEventHandler(handleSharedLocalEvent);
+    }
     session.updateAgentState((currentState) => ({
         ...currentState,
         controlledByUser: currentRunMode === 'local',
@@ -421,23 +532,12 @@ export async function runCodex(opts: {
         session.keepAlive(thinking, currentRunMode);
     }, 2000);
 
-    const sendReady = () => {
-        try {
-            // Use the direct Expo path for Codex completion notifications. It
-            // sends each token separately with high priority and the audible
-            // "AI" Android channel. This path was live-verified as audible on
-            // the device where the production server path arrived silently.
-            sendCodexReadyNotification({
-                sessionId: session.sessionId,
-                metadata: session.getMetadata(),
-                sendReadyEvent: () => session.sendSessionEvent({ type: 'ready' }),
-                sendToAllDevices: (title, body, data) => {
-                    api.push().sendToAllDevices(title, body, data);
-                },
-            });
-        } catch (pushError) {
-            logger.debug('[Codex] Failed to send ready push', pushError);
-        }
+    type HappyServer = Awaited<ReturnType<typeof startHappyServer>>;
+    let happyServer: HappyServer | null = null;
+    const stopHappyMcpServer = (): void => {
+        const server = happyServer as HappyServer | null;
+        happyServer = null;
+        server?.stop();
     };
 
     const launchLocalCodexSession = async (codexThreadId: string | undefined): Promise<
@@ -473,15 +573,26 @@ export async function runCodex(opts: {
             const nativePermissionMode = VALID_REMOTE_PERMISSION_MODES.includes(currentPermissionMode as PermissionMode)
                 ? currentPermissionMode as CodexPermissionMode
                 : undefined;
+            if (useSharedAppServer) {
+                sharedLocalTurnCompletionGate.adoptActiveTurn(client.turnId);
+                permissionHandler?.reset('Local Codex took over approval handling');
+                client.setApprovalHandlingMode('observer');
+            }
             const result = await launchNativeCodex({
                 cwd: process.cwd(),
                 codexHomeDir: process.env.CODEX_HOME,
                 codexThreadId,
-                sandboxConfig,
+                remoteEndpoint: useSharedAppServer ? client.remoteEndpoint ?? undefined : undefined,
+                // The shared app-server already owns Happy's external sandbox.
+                // Wrapping the disposable remote TUI again would create a
+                // second sandbox lifecycle around a client that executes no tools.
+                sandboxConfig: useSharedAppServer ? undefined : sandboxConfig,
                 model: currentModel,
                 effort: currentEffort,
                 permissionMode: nativePermissionMode,
-                onRolloutEvent: handleLocalRolloutEvent,
+                // Shared mode streams the canonical events directly from the
+                // app-server. Tailing the same rollout would duplicate them.
+                onRolloutEvent: useSharedAppServer ? undefined : handleLocalRolloutEvent,
                 onThreadIdDiscovered: (threadId) => {
                     activeCodexThreadId = threadId;
                     session.updateMetadata((currentMetadata) => ({
@@ -524,14 +635,20 @@ export async function runCodex(opts: {
                     sendMappedCodexEvent(pendingLocalTaskStarted);
                     pendingLocalTaskStarted = null;
                 }
-                if (currentTurnId) {
+                if (currentTurnId && !useSharedAppServer) {
                     sendMappedCodexEvent({ type: 'turn_aborted', status: 'cancelled' });
                 }
-                thinking = false;
+                thinking = useSharedAppServer && client.hasActiveTurn();
                 switchToRemote = true;
                 localHandoffRequested = false;
                 currentRunMode = 'remote';
-                activeCodexThreadId = result.codexThreadId ?? activeCodexThreadId;
+                activeCodexThreadId = result.codexThreadId ?? client.threadId ?? activeCodexThreadId;
+                if (activeCodexThreadId) {
+                    session.updateMetadata((currentMetadata) => ({
+                        ...currentMetadata,
+                        codexThreadId: activeCodexThreadId,
+                    }));
+                }
                 session.keepAlive(thinking, 'remote');
                 session.updateAgentState((currentState) => ({
                     ...currentState,
@@ -557,7 +674,15 @@ export async function runCodex(opts: {
             localHandoff = null;
             localTerminate = null;
             if (!switchToRemote) {
+                await sharedLocalSubscriptionPromise;
                 reconnectionHandle?.cancel();
+                try {
+                    await client?.disconnectAndWait();
+                } catch (error) {
+                    logger.debug('[codex]: Error while stopping shared Codex backend', error);
+                    exitCode = 1;
+                }
+                stopHappyMcpServer();
                 try {
                     session.sendSessionDeath();
                     await session.flush();
@@ -672,11 +797,80 @@ export async function runCodex(opts: {
         }
         switchToLocalRequested = true;
         shouldExit = true;
-        await handleAbort();
+        if (useSharedAppServer) {
+            // The TUI will attach to the same persistent app-server after the
+            // current remote turn settles. Do not interrupt that turn merely
+            // to change which client owns input.
+            abortController.abort();
+        } else {
+            await handleAbort();
+        }
         return true;
     };
 
-    let happyServer: Awaited<ReturnType<typeof startHappyServer>> | null = null;
+    const ensureHappyMcpServers = async () => {
+        happyServer ??= await startHappyServer(session);
+        const bridgeEntrypoint = join(projectPath(), 'bin', 'happy-mcp.mjs');
+        return {
+            happy: {
+                command: process.execPath,
+                args: ['--no-warnings', '--no-deprecation', bridgeEntrypoint, '--url', happyServer.url],
+            },
+        } as const;
+    };
+
+    let sharedLocalSubscriptionThreadId: string | null = null;
+    let sharedLocalSubscriptionPromise = Promise.resolve();
+    subscribeSharedLocalThread = (threadId: string): void => {
+        if (!useSharedAppServer || sharedLocalSubscriptionThreadId === threadId) {
+            return;
+        }
+        sharedLocalSubscriptionThreadId = threadId;
+        sharedLocalSubscriptionPromise = sharedLocalSubscriptionPromise.then(async () => {
+            const mcpServers = await ensureHappyMcpServers();
+            const executionPolicy = resolveCodexExecutionPolicy(
+                currentPermissionMode ?? 'default',
+                client.sandboxEnabled,
+            );
+            for (let attempt = 0; ; attempt += 1) {
+                try {
+                    await client.resumeThread({
+                        threadId,
+                        model: currentModel,
+                        cwd: process.cwd(),
+                        approvalPolicy: executionPolicy.approvalPolicy,
+                        sandbox: executionPolicy.sandbox,
+                        mcpServers,
+                        emitActiveTurnSnapshot: true,
+                    });
+                    break;
+                } catch (error) {
+                    const rolloutNotReady = error instanceof CodexRpcError
+                        && error.code === -32600
+                        && error.message.includes('no rollout found');
+                    if (!rolloutNotReady || attempt >= 5) {
+                        throw error;
+                    }
+                    await new Promise((resolve) => setTimeout(resolve, 100 + attempt * 100));
+                }
+            }
+            activeCodexThreadId = threadId;
+            session.updateMetadata((currentMetadata) => ({
+                ...currentMetadata,
+                codexThreadId: threadId,
+            }));
+            logger.debug(`[Codex] Happy subscribed to active local thread ${threadId}`);
+        }).catch((error) => {
+            if (sharedLocalSubscriptionThreadId === threadId) {
+                sharedLocalSubscriptionThreadId = null;
+            }
+            logger.warn(`[Codex] Could not subscribe to active local thread ${threadId}`, error);
+            session.sendSessionEvent({
+                type: 'message',
+                message: 'Happy could not attach to the active local Codex thread; phone updates may be incomplete.',
+            });
+        });
+    };
 
     const restoreParentTerminal = (): void => {
         if (process.stdin.isTTY) {
@@ -733,7 +927,7 @@ export async function runCodex(opts: {
                     logger.debug('[Codex] Error disconnecting Codex during termination', e);
                 }
 
-                happyServer?.stop();
+                stopHappyMcpServer();
                 session.sendSessionDeath();
                 await session.flush();
                 await session.close();
@@ -800,8 +994,60 @@ export async function runCodex(opts: {
     };
     process.on('SIGTERM', handleSigterm);
 
+    if (useSharedAppServer) {
+        try {
+            const mcpServers = await ensureHappyMcpServers();
+            await client.connect();
+            const executionPolicy = resolveCodexExecutionPolicy(
+                currentPermissionMode ?? 'default',
+                client.sandboxEnabled,
+            );
+            const thread = activeCodexThreadId
+                ? await client.resumeThread({
+                    threadId: activeCodexThreadId,
+                    model: currentModel,
+                    cwd: process.cwd(),
+                    approvalPolicy: executionPolicy.approvalPolicy,
+                    sandbox: executionPolicy.sandbox,
+                    mcpServers,
+                })
+                : currentRunMode === 'local'
+                    ? null
+                    : await client.startThread({
+                    model: currentModel,
+                    cwd: process.cwd(),
+                    approvalPolicy: executionPolicy.approvalPolicy,
+                    sandbox: executionPolicy.sandbox,
+                    mcpServers,
+                });
+            if (thread) {
+                activeCodexThreadId = thread.threadId;
+                sharedLocalSubscriptionThreadId = thread.threadId;
+                session.updateMetadata((currentMetadata) => ({
+                    ...currentMetadata,
+                    codexThreadId: thread.threadId,
+                }));
+            }
+        } catch (error) {
+            try { await client.disconnectAndWait(); } catch { }
+            stopHappyMcpServer();
+            reconnectionHandle?.cancel();
+            clearInterval(keepAliveInterval);
+            process.removeListener('SIGTERM', handleSigterm);
+            try {
+                session.sendSessionDeath();
+                await session.flush();
+                await session.close();
+            } catch (cleanupError) {
+                logger.debug('[codex]: Error cleaning up failed shared backend startup', cleanupError);
+            }
+            throw error;
+        }
+    }
+
     if (currentRunMode === 'local') {
         const localResult = await launchLocalCodexSession(activeCodexThreadId);
+        await sharedLocalSubscriptionPromise;
         if (localResult.type === 'exit') {
             process.exit(localResult.code);
         }
@@ -852,7 +1098,9 @@ export async function runCodex(opts: {
     // Start Context 
     //
 
-    client = new CodexAppServerClient(sandboxConfig);
+    if (!useSharedAppServer) {
+        client = new CodexAppServerClient(sandboxConfig);
+    }
 
     permissionHandler = new CodexPermissionHandler(session);
     // Drop any permission requests left in agent state from a previous CLI
@@ -897,6 +1145,15 @@ export async function runCodex(opts: {
 
     // Event handler: same EventMsg types as the legacy MCP server — no changes needed
     client.setEventHandler((msg) => {
+        if (useSharedAppServer && currentRunMode === 'local') {
+            handleSharedLocalEvent(msg);
+            return;
+        }
+        // Phone-originated text is already persisted by the Happy message API.
+        // Only the local TUI path needs the app-server's userMessage item.
+        if (msg.type === 'user_message') {
+            return;
+        }
         logger.debug(`[Codex] Event: ${JSON.stringify(msg)}`);
 
         // Add messages to the ink UI buffer based on message type
@@ -991,19 +1248,16 @@ export async function runCodex(opts: {
         }
     });
 
-    // Start Happy MCP server (HTTP) and prepare STDIO bridge config for Codex
-    happyServer = await startHappyServer(session);
-    // Launch the bridge via `node <path>` (rather than relying on the .mjs shebang)
-    // so it works on Windows, where Windows can't execute shebang scripts directly.
-    // codex would otherwise fail to start the MCP server, the change_title tool would
-    // not be visible to the model, and the model would improvise with shell echoes.
-    const bridgeEntrypoint = join(projectPath(), 'bin', 'happy-mcp.mjs');
-    const mcpServers = {
-        happy: {
-            command: process.execPath,
-            args: ['--no-warnings', '--no-deprecation', bridgeEntrypoint, '--url', happyServer.url]
+    if (useSharedAppServer) {
+        client.setApprovalHandlingMode('active');
+        if (client.hasActiveTurn()) {
+            thinking = true;
+            session.keepAlive(true, 'remote');
         }
-    } as const;
+    }
+
+    // Start Happy MCP server (HTTP) and prepare STDIO bridge config for Codex
+    const mcpServers = await ensureHappyMcpServers();
     let first = true;
 
     try {
@@ -1011,15 +1265,17 @@ export async function runCodex(opts: {
         await client.connect();
         logger.debug('[codex]: client.connect done');
 
-        if (activeCodexThreadId) {
+        const threadToResume = activeCodexThreadId ?? client.threadId ?? undefined;
+        if (threadToResume) {
             await resumeExistingThread({
                 client,
                 session,
                 messageBuffer,
-                threadId: activeCodexThreadId,
+                threadId: threadToResume,
                 cwd: process.cwd(),
                 mcpServers,
             });
+            activeCodexThreadId = threadToResume;
             first = false;
         }
 
@@ -1081,6 +1337,58 @@ export async function runCodex(opts: {
                 const turnPrompt = first
                     ? message.message + '\n\n' + CHANGE_TITLE_INSTRUCTION
                     : message.message;
+
+                if (useSharedAppServer && client.hasActiveTurn()) {
+                    try {
+                        const steered = await client.steerTurn(message.message, {
+                            clientUserMessageId: message.hash,
+                        });
+                        first = false;
+                        logger.debug(`[Codex] Steered phone input into active turn ${steered.turnId}`);
+                        const becameIdle = await client.waitForTurnIdle();
+                        if (!becameIdle) {
+                            throw new Error('Timed out waiting for the steered Codex turn to complete.');
+                        }
+                        continue;
+                    } catch (error) {
+                        if (!(error instanceof CodexRpcError) || error.code !== -32600) {
+                            throw error;
+                        }
+
+                        await client.refreshActiveTurn();
+                        if (client.hasActiveTurn()) {
+                            try {
+                                const steered = await client.steerTurn(message.message, {
+                                    clientUserMessageId: message.hash,
+                                });
+                                first = false;
+                                logger.debug(`[Codex] Steered phone input after reconciling active turn ${steered.turnId}`);
+                                const becameIdle = await client.waitForTurnIdle();
+                                if (!becameIdle) {
+                                    throw new Error('Timed out waiting for the reconciled Codex turn to complete.');
+                                }
+                                continue;
+                            } catch (retryError) {
+                                if (!(retryError instanceof CodexRpcError) || retryError.code !== -32600) {
+                                    throw retryError;
+                                }
+
+                                // The active turn is not steerable (for example,
+                                // review/compact). Preserve the phone message and
+                                // start it exactly once after the root turn idles.
+                                pending = message;
+                                const becameIdle = await client.waitForTurnIdle();
+                                if (!becameIdle) {
+                                    throw new Error('Timed out waiting for the active Codex turn before replaying phone input.');
+                                }
+                                continue;
+                            }
+                        }
+                        // The turn completed between queueing and steering.
+                        // Fall through and start a normal next turn.
+                        logger.debug('[Codex] Active turn completed before steering; starting phone input as the next turn');
+                    }
+                }
 
                 const result = await client.sendTurnAndWait(turnPrompt, {
                     model: message.mode.model,
@@ -1146,26 +1454,31 @@ export async function runCodex(opts: {
             }
         }
 
-        try {
-            logger.debug('[codex]: client.disconnect begin');
-            await client?.disconnectAndWait();
-            logger.debug('[codex]: client.disconnect done');
-        } catch (error) {
-            logger.debug('[codex]: Error while disconnecting client', error);
-            if (switchingToLocal) {
-                canLaunchLocal = false;
-                fatalHandoffError = error instanceof Error ? error : new Error(String(error));
-                session.sendSessionEvent({
-                    type: 'message',
-                    message: 'Could not switch to local mode because the Codex backend did not stop cleanly.',
-                });
+        const preserveSharedBackend = useSharedAppServer && switchingToLocal;
+        if (!preserveSharedBackend) {
+            try {
+                logger.debug('[codex]: client.disconnect begin');
+                await client?.disconnectAndWait();
+                logger.debug('[codex]: client.disconnect done');
+            } catch (error) {
+                logger.debug('[codex]: Error while disconnecting client', error);
+                if (switchingToLocal) {
+                    canLaunchLocal = false;
+                    fatalHandoffError = error instanceof Error ? error : new Error(String(error));
+                    session.sendSessionEvent({
+                        type: 'message',
+                        message: 'Could not switch to local mode because the Codex backend did not stop cleanly.',
+                    });
+                }
             }
         }
 
-        // Stop Happy MCP server
-        logger.debug('[codex]: happyServer.stop');
-        happyServer?.stop();
-        happyServer = null;
+        if (!preserveSharedBackend) {
+            // Stop Happy MCP server only when the backend itself stops. A
+            // shared local/remote handoff keeps tool calls and subagents alive.
+            logger.debug('[codex]: happyServer.stop');
+            stopHappyMcpServer();
+        }
 
         if (inkInstance) {
             logger.debug('[codex]: inkInstance.unmount()');

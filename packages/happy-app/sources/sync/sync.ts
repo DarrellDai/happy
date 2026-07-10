@@ -129,6 +129,8 @@ class Sync {
     private activityAccumulator: ActivityUpdateAccumulator;
     private pendingSettings: Partial<Settings> = loadPendingSettings();
     private appState: AppStateStatus = AppState.currentState;
+    private socketStatus: 'disconnected' | 'connecting' | 'connected' | 'error' = 'disconnected';
+    private sessionsFallbackPoll: ReturnType<typeof setInterval> | null = null;
     private backgroundSendTimeout: ReturnType<typeof setTimeout> | null = null;
     private backgroundSendNotificationId: string | null = null;
     private backgroundSendStartedAt: number | null = null;
@@ -159,6 +161,7 @@ class Sync {
         // Listen for app state changes to refresh purchases
         AppState.addEventListener('change', (nextAppState) => {
             this.appState = nextAppState;
+            this.updateSessionsFallbackPolling();
 
             // Notify server of focus state for push notification routing.
             // Mobile: AppState.currentState reflects fg/bg directly.
@@ -992,6 +995,34 @@ class Sync {
 
     public refreshSessions = async () => {
         return this.sessionsSync.invalidateAndAwait();
+    }
+
+    public handleSocketStatusChange(status: 'disconnected' | 'connecting' | 'connected' | 'error') {
+        this.socketStatus = status;
+        this.updateSessionsFallbackPolling();
+    }
+
+    private updateSessionsFallbackPolling() {
+        const shouldPoll = this.appState === 'active' && this.socketStatus !== 'connected';
+        if (!shouldPoll) {
+            if (this.sessionsFallbackPoll) {
+                clearInterval(this.sessionsFallbackPoll);
+                this.sessionsFallbackPoll = null;
+            }
+            return;
+        }
+
+        if (this.sessionsFallbackPoll) {
+            return;
+        }
+
+        // A websocket-only connection can remain in handshake/retry for a
+        // long time on mobile networks. Keep the durable session directory
+        // available without waiting for the first successful socket connect.
+        this.sessionsSync.invalidate();
+        this.sessionsFallbackPoll = setInterval(() => {
+            this.sessionsSync.invalidate();
+        }, 10_000);
     }
 
     public getCredentials() {
@@ -2563,6 +2594,7 @@ class Sync {
 
 
         const sessions: Session[] = [];
+        let sawUnknownSession = false;
 
         for (const [sessionId, update] of updates) {
             const session = storage.getState().sessions[sessionId];
@@ -2574,6 +2606,11 @@ class Sync {
                     thinking: update.thinking ?? false,
                     thinkingAt: update.activeAt // Always use activeAt for consistency
                 });
+            } else {
+                // A new-session update is best-effort and Socket.IO replay is
+                // disabled. Activity for an unknown ID proves our session list
+                // is stale, so recover it from the durable REST endpoint.
+                sawUnknownSession = true;
             }
         }
 
@@ -2581,6 +2618,9 @@ class Sync {
             // console.log('flushing activity updates ' + sessions.length);
             this.applySessions(sessions);
             // log.log(`🔄 Activity updates flushed - updated ${sessions.length} sessions`);
+        }
+        if (sawUnknownSession) {
+            this.sessionsSync.invalidate();
         }
     }
 
@@ -2717,6 +2757,7 @@ async function syncInit(credentials: AuthCredentials, restore: boolean) {
     // Wire socket status to storage
     apiSocket.onStatusChange((status) => {
         storage.getState().setSocketStatus(status);
+        sync.handleSocketStatusChange(status);
     });
 
     // Initialize sessions engine

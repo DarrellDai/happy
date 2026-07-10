@@ -47,6 +47,37 @@ describe('buildCodexNativeArgs', () => {
         ]);
     });
 
+    it('connects the native TUI to a shared app-server before resuming', () => {
+        expect(buildCodexNativeArgs({
+            codexThreadId: 'thread-shared',
+            remoteEndpoint: 'ws://127.0.0.1:43210',
+            permissionMode: 'default',
+        })).toEqual([
+            '--remote',
+            'ws://127.0.0.1:43210',
+            'resume',
+            'thread-shared',
+            '--ask-for-approval',
+            'untrusted',
+            '--sandbox',
+            'workspace-write',
+        ]);
+    });
+
+    it('lets a remote TUI create the first shared thread', () => {
+        expect(buildCodexNativeArgs({
+            remoteEndpoint: 'ws://127.0.0.1:43210',
+            permissionMode: 'default',
+        })).toEqual([
+            '--remote',
+            'ws://127.0.0.1:43210',
+            '--ask-for-approval',
+            'untrusted',
+            '--sandbox',
+            'workspace-write',
+        ]);
+    });
+
     it('maps read-only permission mode to native approval and sandbox flags', () => {
         expect(buildCodexNativeArgs({
             permissionMode: 'read-only',
@@ -95,6 +126,7 @@ describe('launchNativeCodex', () => {
         const result = await launchNativeCodex({
             cwd: '/tmp/project',
             codexThreadId: 'thread-existing',
+            remoteEndpoint: 'ws://127.0.0.1:43210',
             originatorOverride: 'happy-test-launch',
             model: 'gpt-5.5',
             effort: 'medium',
@@ -116,6 +148,8 @@ describe('launchNativeCodex', () => {
         expect(spawnCalls).toEqual([{
             command: 'codex',
             args: [
+                '--remote',
+                'ws://127.0.0.1:43210',
                 'resume',
                 'thread-existing',
                 '--model',
@@ -129,6 +163,8 @@ describe('launchNativeCodex', () => {
                 stdio: 'inherit',
                 env: expect.objectContaining({
                     CODEX_INTERNAL_ORIGINATOR_OVERRIDE: 'happy-test-launch',
+                    NO_PROXY: expect.stringContaining('127.0.0.1'),
+                    no_proxy: expect.stringContaining('127.0.0.1'),
                 }),
             }),
         }]);

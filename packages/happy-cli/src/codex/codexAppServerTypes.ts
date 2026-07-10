@@ -84,6 +84,17 @@ export type InterruptConversationResponse = {
     abortReason: TurnAbortReason;
 };
 
+export type SteerConversationParams = {
+    threadId: ThreadId;
+    expectedTurnId: string;
+    input: InputItem[];
+    clientUserMessageId?: string | null;
+};
+
+export type SteerConversationResponse = {
+    turnId: string;
+};
+
 // --- Approvals (server → client requests) ---
 
 export type ExecCommandApprovalParams = {
@@ -170,7 +181,7 @@ export type JsonRpcRequest = {
 
 export type JsonRpcResponse = {
     jsonrpc?: "2.0";
-    id: number;
+    id: number | string;
     result?: unknown;
     error?: { code: number; message: string; data?: unknown };
 };

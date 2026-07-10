@@ -1,5 +1,5 @@
 import React from 'react';
-import { View, Pressable, FlatList, Platform } from 'react-native';
+import { View, Pressable, FlatList, Platform, RefreshControl } from 'react-native';
 import { Text } from '@/components/StyledText';
 import { usePathname } from 'expo-router';
 import { SessionListViewItem, SessionRowData } from '@/sync/storage';
@@ -21,6 +21,7 @@ import { SessionActionsAnchor, SessionActionsPopover } from './SessionActionsPop
 import { useSessionActionAlert } from '@/hooks/useSessionQuickActions';
 import { useSettingMutable } from '@/sync/storage';
 import { t } from '@/text';
+import { sync } from '@/sync/sync';
 
 const stylesheet = StyleSheet.create((theme) => ({
     container: {
@@ -202,7 +203,16 @@ export function SessionsList() {
     const data = useVisibleSessionListViewData();
     const pathname = usePathname();
     const isTablet = useIsTablet();
+    const [refreshing, setRefreshing] = React.useState(false);
     const [hideInactiveSessions, setHideInactiveSessions] = useSettingMutable('hideInactiveSessions');
+    const handleRefresh = React.useCallback(async () => {
+        setRefreshing(true);
+        try {
+            await sync.refreshSessions();
+        } finally {
+            setRefreshing(false);
+        }
+    }, []);
     const toggleArchived = React.useCallback(() => {
         setHideInactiveSessions(!hideInactiveSessions);
     }, [hideInactiveSessions, setHideInactiveSessions]);
@@ -329,6 +339,9 @@ export function SessionsList() {
                     windowSize={5}
                     maxToRenderPerBatch={8}
                     initialNumToRender={12}
+                    refreshControl={Platform.OS !== 'web' ? (
+                        <RefreshControl refreshing={refreshing} onRefresh={handleRefresh} />
+                    ) : undefined}
                 />
             </View>
         </View>
