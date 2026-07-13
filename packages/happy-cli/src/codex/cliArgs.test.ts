@@ -132,6 +132,44 @@ describe('extractCodexResumeFlag', () => {
         expect(parsed.args).toEqual(['--started-by', 'daemon']);
     });
 
+    it('preserves native positional resume syntax for a picker or thread ID', () => {
+        expect(extractCodexResumeFlag([
+            'resume',
+            '--all',
+        ])).toEqual({
+            resumeThreadId: null,
+            nativeResumeArgs: ['--all'],
+            args: [],
+        });
+        expect(extractCodexResumeFlag([
+            'resume',
+            'thread-positional',
+            'continue now',
+            '--started-by',
+            'terminal',
+        ])).toEqual({
+            resumeThreadId: null,
+            nativeResumeArgs: ['thread-positional', 'continue now'],
+            args: ['--started-by', 'terminal'],
+        });
+    });
+
+    it('recognizes native resume after Happy wrapper flags', () => {
+        expect(extractCodexResumeFlag([
+            '--started-by',
+            'daemon',
+            '--happy-starting-mode',
+            'local',
+            'resume',
+            '--last',
+        ])).toEqual({
+            resumeThreadId: null,
+            nativeResumeArgs: ['--last'],
+            startingMode: 'local',
+            args: ['--started-by', 'daemon'],
+        });
+    });
+
     it('supports equals syntax', () => {
         const parsed = extractCodexResumeFlag(['--resume=thread-456', '--started-by', 'terminal']);
 
@@ -166,6 +204,12 @@ describe('extractCodexResumeFlag', () => {
     it('throws when resume flag is missing a thread ID', () => {
         expect(() => extractCodexResumeFlag(['--resume'])).toThrow(
             'Codex resume requires a thread ID: happy codex --resume <thread-id>',
+        );
+    });
+
+    it('rejects combining positional and flag resume forms', () => {
+        expect(() => extractCodexResumeFlag(['resume', '--resume', 'thread-123'])).toThrow(
+            'Codex resume flag can only be provided once.',
         );
     });
 });

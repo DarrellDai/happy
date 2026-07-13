@@ -101,6 +101,7 @@ async function waitForDiscoveredThreadId(opts: {
 
 export function buildCodexNativeArgs(opts: {
     codexThreadId?: string;
+    nativeResumeArgs?: string[];
     remoteEndpoint?: string;
     model?: string;
     effort?: ReasoningEffort;
@@ -115,6 +116,8 @@ export function buildCodexNativeArgs(opts: {
 
     if (opts.codexThreadId) {
         args.push('resume', opts.codexThreadId);
+    } else if (opts.nativeResumeArgs) {
+        args.push('resume', ...opts.nativeResumeArgs);
     }
 
     if (opts.model) {
@@ -153,6 +156,7 @@ export async function launchNativeCodex(opts: {
     cwd: string;
     codexHomeDir?: string;
     codexThreadId?: string;
+    nativeResumeArgs?: string[];
     remoteEndpoint?: string;
     model?: string;
     effort?: ReasoningEffort;

@@ -84,6 +84,41 @@ describe('buildCodexNativeArgs', () => {
         ]);
     });
 
+    it('opens the native resume picker against the shared app-server', () => {
+        expect(buildCodexNativeArgs({
+            nativeResumeArgs: [],
+            remoteEndpoint: 'ws://127.0.0.1:43210',
+            permissionMode: 'yolo',
+        })).toEqual([
+            '--remote',
+            'ws://127.0.0.1:43210',
+            'resume',
+            '--ask-for-approval',
+            'never',
+            '--sandbox',
+            'danger-full-access',
+        ]);
+    });
+
+    it('forwards native resume target, picker flags, and prompt', () => {
+        expect(buildCodexNativeArgs({
+            nativeResumeArgs: ['thread-123', '--all', 'continue now'],
+            remoteEndpoint: 'ws://127.0.0.1:43210',
+            permissionMode: 'yolo',
+        })).toEqual([
+            '--remote',
+            'ws://127.0.0.1:43210',
+            'resume',
+            'thread-123',
+            '--all',
+            'continue now',
+            '--ask-for-approval',
+            'never',
+            '--sandbox',
+            'danger-full-access',
+        ]);
+    });
+
     it('maps read-only permission mode to native approval and sandbox flags', () => {
         expect(buildCodexNativeArgs({
             permissionMode: 'read-only',

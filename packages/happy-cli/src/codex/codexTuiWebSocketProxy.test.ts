@@ -337,7 +337,7 @@ describe('startCodexTuiWebSocketProxy', () => {
         ]);
     });
 
-    it('rejects a second concurrent TUI so selections have one controller', async () => {
+    it('allows a later picker connection to select a thread', async () => {
         const target = await createTargetServer();
         const selections: CodexTuiThreadSelection[] = [];
         const proxy = await startProxy({
@@ -350,25 +350,276 @@ describe('startCodexTuiWebSocketProxy', () => {
         const firstUpstreamConnection = nextConnection(target.server);
         const firstTui = await connect(proxy.endpoint);
         const firstUpstream = await firstUpstreamConnection;
+
+        const secondUpstreamConnection = nextConnection(target.server);
         const secondTui = await connect(proxy.endpoint);
-        await waitForClose(secondTui);
-        expect(target.server.clients.size).toBe(1);
+        const secondUpstream = await secondUpstreamConnection;
+        expect(target.server.clients.size).toBe(2);
 
-        const firstRequest = collectFrames(firstUpstream, 1);
-        sendJson(firstTui, { jsonrpc: '2.0', id: 1, method: 'thread/resume', params: {} });
-        await firstRequest;
+        const pickerRequest = collectFrames(secondUpstream, 1);
+        sendJson(secondTui, { jsonrpc: '2.0', id: 20, method: 'thread/list', params: {} });
+        await pickerRequest;
+        const pickerResponse = collectFrames(secondTui, 1);
+        sendJson(secondUpstream, {
+            jsonrpc: '2.0', id: 20,
+            result: { data: [], nextCursor: null },
+        });
+        await pickerResponse;
 
-        const firstResponse = collectFrames(firstTui, 1);
-        sendJson(firstUpstream, {
+        const selectionRequest = collectFrames(secondUpstream, 1);
+        sendJson(secondTui, { jsonrpc: '2.0', id: 1, method: 'thread/resume', params: {} });
+        await selectionRequest;
+
+        const selectionResponse = collectFrames(secondTui, 1);
+        sendJson(secondUpstream, {
             jsonrpc: '2.0', id: 1,
+            result: { thread: { id: 'picker-root', parentThreadId: null } },
+        });
+        await selectionResponse;
+        await proxy.waitForIdle();
+
+        expect(selections).toEqual([
+            { threadId: 'picker-root', method: 'thread/resume' },
+        ]);
+        expect(firstTui.readyState).toBe(WebSocket.OPEN);
+        expect(firstUpstream.readyState).toBe(WebSocket.OPEN);
+    });
+
+    it('serializes overlapping selections across connections with connection-scoped request ids', async () => {
+        const target = await createTargetServer();
+        let releaseFirstSelection: () => void = () => undefined;
+        const firstSelectionGate = new Promise<void>((resolve) => {
+            releaseFirstSelection = resolve;
+        });
+        let markFirstSelectionStarted: () => void = () => undefined;
+        const firstSelectionStarted = new Promise<void>((resolve) => {
+            markFirstSelectionStarted = resolve;
+        });
+        const selections: CodexTuiThreadSelection[] = [];
+        const proxy = await startProxy({
+            targetEndpoint: target.endpoint,
+            onThreadSelected: async (selection) => {
+                selections.push(selection);
+                if (selection.threadId === 'first-root') {
+                    markFirstSelectionStarted();
+                    await firstSelectionGate;
+                }
+            },
+        });
+
+        const firstUpstreamConnection = nextConnection(target.server);
+        const firstTui = await connect(proxy.endpoint);
+        const firstUpstream = await firstUpstreamConnection;
+        const secondUpstreamConnection = nextConnection(target.server);
+        const secondTui = await connect(proxy.endpoint);
+        const secondUpstream = await secondUpstreamConnection;
+
+        const requests = Promise.all([
+            collectFrames(firstUpstream, 1),
+            collectFrames(secondUpstream, 1),
+        ]);
+        // The same request ID is valid because JSON-RPC IDs are scoped to each
+        // WebSocket connection.
+        sendJson(firstTui, { jsonrpc: '2.0', id: 21, method: 'thread/resume', params: {} });
+        sendJson(secondTui, { jsonrpc: '2.0', id: 21, method: 'thread/resume', params: {} });
+        await requests;
+
+        const receivedByFirst: string[] = [];
+        const receivedBySecond: string[] = [];
+        firstTui.on('message', (data) => receivedByFirst.push(copyData(data).toString('utf8')));
+        secondTui.on('message', (data) => receivedBySecond.push(copyData(data).toString('utf8')));
+        const firstForwarded = collectFrames(firstTui, 1);
+        const secondForwarded = collectFrames(secondTui, 1);
+        sendJson(firstUpstream, {
+            jsonrpc: '2.0', id: 21,
             result: { thread: { id: 'first-root', parentThreadId: null } },
         });
-        await firstResponse;
-        await proxy.waitForIdle();
+        await firstSelectionStarted;
+        sendJson(secondUpstream, {
+            jsonrpc: '2.0', id: 21,
+            result: { thread: { id: 'second-root', parentThreadId: null } },
+        });
+        await new Promise<void>((resolve) => setImmediate(resolve));
 
         expect(selections).toEqual([
             { threadId: 'first-root', method: 'thread/resume' },
         ]);
+        expect(receivedByFirst).toEqual([]);
+        expect(receivedBySecond).toEqual([]);
+
+        releaseFirstSelection();
+        await Promise.all([firstForwarded, secondForwarded]);
+        await proxy.waitForIdle();
+
+        expect(selections).toEqual([
+            { threadId: 'first-root', method: 'thread/resume' },
+            { threadId: 'second-root', method: 'thread/resume' },
+        ]);
+        expect(receivedByFirst).toHaveLength(1);
+        expect(receivedBySecond).toHaveLength(1);
+    });
+
+    it('keeps a batch of selections atomic against another connection', async () => {
+        const target = await createTargetServer();
+        let releaseFirstSelection: () => void = () => undefined;
+        const firstSelectionGate = new Promise<void>((resolve) => {
+            releaseFirstSelection = resolve;
+        });
+        let markFirstSelectionStarted: () => void = () => undefined;
+        const firstSelectionStarted = new Promise<void>((resolve) => {
+            markFirstSelectionStarted = resolve;
+        });
+        const selectionOrder: string[] = [];
+        const proxy = await startProxy({
+            targetEndpoint: target.endpoint,
+            onThreadSelected: async (selection) => {
+                selectionOrder.push(selection.threadId);
+                if (selection.threadId === 'batch-first') {
+                    markFirstSelectionStarted();
+                    await firstSelectionGate;
+                }
+            },
+        });
+
+        const firstUpstreamConnection = nextConnection(target.server);
+        const firstTui = await connect(proxy.endpoint);
+        const firstUpstream = await firstUpstreamConnection;
+        const secondUpstreamConnection = nextConnection(target.server);
+        const secondTui = await connect(proxy.endpoint);
+        const secondUpstream = await secondUpstreamConnection;
+
+        const requests = Promise.all([
+            collectFrames(firstUpstream, 1),
+            collectFrames(secondUpstream, 1),
+        ]);
+        sendJson(firstTui, [
+            { jsonrpc: '2.0', id: 31, method: 'thread/resume', params: {} },
+            { jsonrpc: '2.0', id: 32, method: 'thread/fork', params: {} },
+        ]);
+        sendJson(secondTui, {
+            jsonrpc: '2.0', id: 33, method: 'thread/resume', params: {},
+        });
+        await requests;
+
+        const firstForwarded = collectFrames(firstTui, 1);
+        const secondForwarded = collectFrames(secondTui, 1);
+        sendJson(firstUpstream, [
+            {
+                jsonrpc: '2.0', id: 31,
+                result: { thread: { id: 'batch-first', parentThreadId: null } },
+            },
+            {
+                jsonrpc: '2.0', id: 32,
+                result: { thread: { id: 'batch-second', parentThreadId: null } },
+            },
+        ]);
+        await firstSelectionStarted;
+        sendJson(secondUpstream, {
+            jsonrpc: '2.0', id: 33,
+            result: { thread: { id: 'other-connection', parentThreadId: null } },
+        });
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        expect(selectionOrder).toEqual(['batch-first']);
+
+        releaseFirstSelection();
+        await Promise.all([firstForwarded, secondForwarded]);
+        await proxy.waitForIdle();
+
+        expect(selectionOrder).toEqual([
+            'batch-first',
+            'batch-second',
+            'other-connection',
+        ]);
+    });
+
+    it('delivers one selection response before adopting from another connection', async () => {
+        const target = await createTargetServer();
+        const selectionOrder: string[] = [];
+        const proxy = await startProxy({
+            targetEndpoint: target.endpoint,
+            onThreadSelected: async (selection) => {
+                selectionOrder.push(selection.threadId);
+            },
+        });
+
+        const firstUpstreamConnection = nextConnection(target.server);
+        const firstTui = await connect(proxy.endpoint);
+        const firstUpstream = await firstUpstreamConnection;
+        const secondUpstreamConnection = nextConnection(target.server);
+        const secondTui = await connect(proxy.endpoint);
+        const secondUpstream = await secondUpstreamConnection;
+
+        const requests = Promise.all([
+            collectFrames(firstUpstream, 1),
+            collectFrames(secondUpstream, 1),
+        ]);
+        sendJson(firstTui, { jsonrpc: '2.0', id: 41, method: 'thread/resume', params: {} });
+        sendJson(secondTui, { jsonrpc: '2.0', id: 42, method: 'thread/resume', params: {} });
+        await requests;
+
+        let markSendCallbackHeld: () => void = () => undefined;
+        const sendCallbackHeld = new Promise<void>((resolve) => {
+            markSendCallbackHeld = resolve;
+        });
+        let releaseSendCallback: () => void = () => undefined;
+        const originalSend = WebSocket.prototype.send;
+        WebSocket.prototype.send = function delayedSelectionResponse(
+            this: WebSocket,
+            ...args: unknown[]
+        ): void {
+            const data = args[0];
+            const text = typeof data === 'string'
+                ? data
+                : Buffer.isBuffer(data) ? data.toString('utf8') : '';
+            const callbackIndex = typeof args[2] === 'function'
+                ? 2
+                : typeof args[1] === 'function' ? 1 : -1;
+            if (
+                callbackIndex >= 0
+                && text.includes('"id":41')
+                && text.includes('first-response-root')
+            ) {
+                const callback = args[callbackIndex] as (error?: Error) => void;
+                const delayedArgs = [...args];
+                delayedArgs[callbackIndex] = (error?: Error): void => {
+                    releaseSendCallback = () => callback(error);
+                    markSendCallbackHeld();
+                };
+                Reflect.apply(originalSend, this, delayedArgs);
+                return;
+            }
+            Reflect.apply(originalSend, this, args);
+        } as typeof originalSend;
+
+        try {
+            const firstForwarded = collectFrames(firstTui, 1);
+            const secondForwarded = collectFrames(secondTui, 1);
+            sendJson(firstUpstream, {
+                jsonrpc: '2.0', id: 41,
+                result: { thread: { id: 'first-response-root', parentThreadId: null } },
+            });
+            await Promise.all([firstForwarded, sendCallbackHeld]);
+
+            sendJson(secondUpstream, {
+                jsonrpc: '2.0', id: 42,
+                result: { thread: { id: 'second-response-root', parentThreadId: null } },
+            });
+            await new Promise<void>((resolve) => setImmediate(resolve));
+
+            expect(selectionOrder).toEqual(['first-response-root']);
+
+            releaseSendCallback();
+            await secondForwarded;
+            await proxy.waitForIdle();
+            expect(selectionOrder).toEqual([
+                'first-response-root',
+                'second-response-root',
+            ]);
+        } finally {
+            releaseSendCallback();
+            WebSocket.prototype.send = originalSend;
+        }
     });
 
     it('ignores errors, unrelated responses, malformed results, duplicates, and child threads', async () => {
@@ -417,14 +668,18 @@ describe('startCodexTuiWebSocketProxy', () => {
         expect(onThreadSelected).not.toHaveBeenCalled();
     });
 
-    it('reports a failed adoption callback and returns an error instead of false success', async () => {
+    it('returns an adoption error and recovers the selection queue for later responses', async () => {
         const target = await createTargetServer();
         const callbackError = new Error('adoption failed');
         const onError = vi.fn();
+        const selections: string[] = [];
         const proxy = await startProxy({
             targetEndpoint: target.endpoint,
-            onThreadSelected: async () => {
-                throw callbackError;
+            onThreadSelected: async (selection) => {
+                selections.push(selection.threadId);
+                if (selection.threadId === 'not-adopted') {
+                    throw callbackError;
+                }
             },
             onError,
         });
@@ -432,27 +687,37 @@ describe('startCodexTuiWebSocketProxy', () => {
         const tui = await connect(proxy.endpoint);
         const upstream = await upstreamConnection;
 
-        const request = collectFrames(upstream, 1);
+        const requests = collectFrames(upstream, 2);
         sendJson(tui, { jsonrpc: '2.0', id: 12, method: 'thread/resume', params: {} });
-        await request;
+        sendJson(tui, { jsonrpc: '2.0', id: 13, method: 'thread/resume', params: {} });
+        await requests;
 
-        const response = {
+        const failedResponse = {
             jsonrpc: '2.0', id: 12,
             result: { thread: { id: 'not-adopted', parentThreadId: null } },
         };
-        const forwarded = collectFrames(tui, 1);
-        sendJson(upstream, response);
-        const [frame] = await forwarded;
+        const recoveredResponse = {
+            jsonrpc: '2.0', id: 13,
+            result: { thread: { id: 'adopted-after-failure', parentThreadId: null } },
+        };
+        const forwarded = collectFrames(tui, 2);
+        sendJson(upstream, failedResponse);
+        sendJson(upstream, recoveredResponse);
+        const frames = await forwarded;
         await proxy.waitForIdle();
 
-        expect(JSON.parse(frame.data.toString('utf8'))).toEqual({
-            jsonrpc: '2.0',
-            id: 12,
-            error: {
-                code: -32098,
-                message: 'Happy could not attach to the selected Codex thread. Please retry.',
+        expect(frames.map((frame) => JSON.parse(frame.data.toString('utf8')))).toEqual([
+            {
+                jsonrpc: '2.0',
+                id: 12,
+                error: {
+                    code: -32098,
+                    message: 'Happy could not attach to the selected Codex thread. Please retry.',
+                },
             },
-        });
+            recoveredResponse,
+        ]);
+        expect(selections).toEqual(['not-adopted', 'adopted-after-failure']);
         expect(onError).toHaveBeenCalledTimes(1);
         expect(onError).toHaveBeenCalledWith(callbackError);
     });

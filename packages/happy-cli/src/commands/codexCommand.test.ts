@@ -48,6 +48,7 @@ describe('handleCodexCommand', () => {
       startedBy: 'terminal',
       noSandbox: false,
       resumeThreadId: undefined,
+      nativeResumeArgs: undefined,
       startingMode: undefined,
       permissionMode: undefined,
     })
@@ -84,6 +85,7 @@ describe('handleCodexCommand', () => {
       startedBy: 'daemon',
       noSandbox: true,
       resumeThreadId: 'thread-123',
+      nativeResumeArgs: undefined,
       startingMode: 'remote',
       permissionMode: undefined,
     })
@@ -104,8 +106,45 @@ describe('handleCodexCommand', () => {
       startedBy: 'terminal',
       noSandbox: false,
       resumeThreadId: undefined,
+      nativeResumeArgs: undefined,
       startingMode: undefined,
       permissionMode: 'yolo',
     })
+  })
+
+  it('passes a native bare resume command through as a startup picker', async () => {
+    await handleCodexCommand([
+      'resume',
+      '--sandbox',
+      'danger-full-access',
+      '--ask-for-approval',
+      'never',
+    ])
+
+    expect(mocks.mockRunCodex).toHaveBeenCalledWith({
+      credentials: { token: 'token' },
+      startedBy: undefined,
+      noSandbox: false,
+      resumeThreadId: undefined,
+      nativeResumeArgs: [],
+      startingMode: undefined,
+      permissionMode: 'yolo',
+    })
+  })
+
+  it('accepts native policy flags before resume and forwards resume options', async () => {
+    await handleCodexCommand([
+      '--sandbox',
+      'danger-full-access',
+      '--ask-for-approval',
+      'never',
+      'resume',
+      '--last',
+    ])
+
+    expect(mocks.mockRunCodex).toHaveBeenCalledWith(expect.objectContaining({
+      permissionMode: 'yolo',
+      nativeResumeArgs: ['--last'],
+    }))
   })
 })

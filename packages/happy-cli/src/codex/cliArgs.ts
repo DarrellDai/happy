@@ -168,18 +168,20 @@ export function extractCodexPermissionFlags(args: string[]): {
 
 export function extractCodexResumeFlag(args: string[]): {
     resumeThreadId: string | null;
+    nativeResumeArgs?: string[];
     startingMode?: CodexStartingMode;
     args: string[];
 } {
     const remainingArgs: string[] = [];
     let resumeThreadId: string | null = null;
+    let nativeResumeArgs: string[] | undefined;
     let startingMode: CodexStartingMode | undefined;
 
     for (let i = 0; i < args.length; i++) {
         const arg = args[i];
 
         if (arg === '--resume' || arg === '-r') {
-            if (resumeThreadId !== null) {
+            if (resumeThreadId !== null || nativeResumeArgs) {
                 throw new Error('Codex resume flag can only be provided once.');
             }
 
@@ -194,7 +196,7 @@ export function extractCodexResumeFlag(args: string[]): {
         }
 
         if (arg.startsWith('--resume=')) {
-            if (resumeThreadId !== null) {
+            if (resumeThreadId !== null || nativeResumeArgs) {
                 throw new Error('Codex resume flag can only be provided once.');
             }
 
@@ -218,11 +220,35 @@ export function extractCodexResumeFlag(args: string[]): {
             continue;
         }
 
+        if (arg === '--started-by') {
+            remainingArgs.push(arg);
+            if (args[i + 1]) {
+                remainingArgs.push(args[++i]);
+            }
+            continue;
+        }
+
+        if (nativeResumeArgs === undefined && arg === 'resume') {
+            if (resumeThreadId !== null) {
+                throw new Error('Codex resume flag can only be provided once.');
+            }
+            nativeResumeArgs = [];
+            continue;
+        }
+
+        if (nativeResumeArgs) {
+            // Forward every native resume option, target, and optional prompt
+            // unchanged after extracting Happy's own wrapper arguments.
+            nativeResumeArgs.push(arg);
+            continue;
+        }
+
         remainingArgs.push(arg);
     }
 
     return {
         resumeThreadId,
+        ...(nativeResumeArgs ? { nativeResumeArgs } : {}),
         ...(startingMode ? { startingMode } : {}),
         args: remainingArgs,
     };

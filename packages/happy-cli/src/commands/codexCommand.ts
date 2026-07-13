@@ -7,12 +7,12 @@ import { ensureDaemonRunning } from '@/daemon/ensureDaemonRunning'
 export async function handleCodexCommand(args: string[]): Promise<void> {
   let startedBy: 'daemon' | 'terminal' | undefined = undefined
   const sandboxArgs = extractNoSandboxFlag(args)
-  const codexArgs = extractCodexResumeFlag(sandboxArgs.args)
-  const permissionArgs = extractCodexPermissionFlags(codexArgs.args)
+  const permissionArgs = extractCodexPermissionFlags(sandboxArgs.args)
+  const codexArgs = extractCodexResumeFlag(permissionArgs.args)
 
-  for (let i = 0; i < permissionArgs.args.length; i++) {
-    if (permissionArgs.args[i] === '--started-by') {
-      startedBy = permissionArgs.args[++i] as 'daemon' | 'terminal'
+  for (let i = 0; i < codexArgs.args.length; i++) {
+    if (codexArgs.args[i] === '--started-by') {
+      startedBy = codexArgs.args[++i] as 'daemon' | 'terminal'
     }
   }
 
@@ -24,6 +24,7 @@ export async function handleCodexCommand(args: string[]): Promise<void> {
     startedBy,
     noSandbox: sandboxArgs.noSandbox,
     resumeThreadId: codexArgs.resumeThreadId ?? undefined,
+    nativeResumeArgs: codexArgs.nativeResumeArgs,
     startingMode: codexArgs.startingMode,
     permissionMode: permissionArgs.permissionMode,
   })

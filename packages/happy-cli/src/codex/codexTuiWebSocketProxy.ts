@@ -324,9 +324,11 @@ export async function startCodexTuiWebSocketProxy(
         throw new Error(`Codex TUI proxy target cannot contain a URL fragment: ${opts.targetEndpoint}`);
     }
 
-    const sessions = new Set<{ close(): void; terminate(): void }>();
+    type RelaySession = { close(): void; terminate(): void };
+    const sessions = new Set<RelaySession>();
     const upstreamSockets = new Set<WebSocket>();
     const inFlightServerFrames = new Set<Promise<void>>();
+    let selectionTransactionTail = Promise.resolve();
     let proxyClosing = false;
     let closePromise: Promise<void> | null = null;
 
@@ -358,13 +360,9 @@ export async function startCodexTuiWebSocketProxy(
             downstream.close(1012, 'proxy closing');
             return;
         }
-        // This relay belongs to one launched native TUI. Accepting concurrent
-        // controllers would make two connection-scoped selections race for
-        // Happy's single active root.
-        if (sessions.size > 0) {
-            downstream.close(1013, 'native TUI already attached');
-            return;
-        }
+        // Codex may use multiple app-server connections during startup and an
+        // in-TUI picker. Correlation remains connection-scoped below, while
+        // selection adoption is serialized proxy-wide.
 
         const pendingSelections = new Map<JsonRpcId, PendingSelection>();
         let upstream: WebSocket;
@@ -393,7 +391,10 @@ export async function startCodexTuiWebSocketProxy(
             settleUpstreamReady(ready);
         };
 
-        const session = {
+        const detachSession = (session: RelaySession): void => {
+            sessions.delete(session);
+        };
+        const session: RelaySession = {
             close(): void {
                 if (sessionClosed) {
                     return;
@@ -401,7 +402,7 @@ export async function startCodexTuiWebSocketProxy(
                 sessionClosed = true;
                 pendingSelections.clear();
                 resolveUpstreamReady(false);
-                sessions.delete(session);
+                detachSession(session);
                 closeSocket(downstream);
                 closeSocket(upstream);
             },
@@ -410,7 +411,7 @@ export async function startCodexTuiWebSocketProxy(
                     sessionClosed = true;
                     pendingSelections.clear();
                     resolveUpstreamReady(false);
-                    sessions.delete(session);
+                    detachSession(session);
                 }
                 downstream.terminate();
                 upstream.terminate();
@@ -446,31 +447,52 @@ export async function startCodexTuiWebSocketProxy(
         upstream.on('message', (data, isBinary) => {
             const frame = copyFrame(data, isBinary);
             // Consume correlation synchronously so a subsequent socket close
-            // cannot discard a response that has already arrived.
+            // cannot discard a response that has already arrived. Selection
+            // transactions are also reserved here, in response-observation
+            // order, rather than later when this connection's FIFO is ready.
             const selections = consumeThreadSelections(frame, pendingSelections);
-            const task = serverToClientTail.then(async () => {
-                const failedSelectionIds = new Set<JsonRpcId>();
-                for (const correlated of selections) {
-                    try {
-                        await opts.onThreadSelected(correlated.selection);
-                    } catch (error) {
-                        failedSelectionIds.add(correlated.id);
-                        reportError(error, `Failed to adopt Codex thread ${correlated.selection.threadId}`);
-                    }
-                }
-                try {
-                    await sendFrame(
-                        downstream,
-                        replaceFailedSelectionResponses(frame, failedSelectionIds),
-                    );
-                } catch (error) {
+            const priorConnectionTail = serverToClientTail;
+            const forwardToTui = (outboundFrame: QueuedFrame): Promise<void> => (
+                sendFrame(downstream, outboundFrame)
+            );
+
+            let task: Promise<void>;
+            if (selections.length === 0) {
+                task = priorConnectionTail.then(() => forwardToTui(frame)).catch((error) => {
                     if (!sessionClosed && !proxyClosing) {
                         reportError(error, 'Failed to forward a Codex app-server message to the TUI');
                     }
-                }
-            }).catch((error) => {
-                reportError(error, 'Unexpected Codex TUI proxy forwarding failure');
-            });
+                });
+            } else {
+                // Codex selects on a new main connection after the startup
+                // picker, but uses the existing main connection after an
+                // in-TUI picker. Every connection is therefore selection-
+                // capable. Serialize the complete adoption/response exchange
+                // proxy-wide while retaining each connection's own FIFO and
+                // request-id namespace.
+                const transaction = selectionTransactionTail.then(async () => {
+                    await priorConnectionTail;
+                    const failedSelectionIds = new Set<JsonRpcId>();
+                    for (const correlated of selections) {
+                        try {
+                            await opts.onThreadSelected(correlated.selection);
+                        } catch (error) {
+                            failedSelectionIds.add(correlated.id);
+                            reportError(error, `Failed to adopt Codex thread ${correlated.selection.threadId}`);
+                        }
+                    }
+                    await forwardToTui(replaceFailedSelectionResponses(frame, failedSelectionIds));
+                });
+                // Keep the internal tail fulfilled so one failed transaction
+                // cannot poison later selections. The per-frame task still
+                // reports the original unexpected failure before recovering.
+                task = transaction.catch((error) => {
+                    if (!sessionClosed && !proxyClosing) {
+                        reportError(error, 'Failed to deliver a Codex thread-selection response to the TUI');
+                    }
+                });
+                selectionTransactionTail = task;
+            }
             serverToClientTail = task;
             trackServerFrame(task);
         });
@@ -480,7 +502,7 @@ export async function startCodexTuiWebSocketProxy(
                 sessionClosed = true;
                 pendingSelections.clear();
                 resolveUpstreamReady(false);
-                sessions.delete(session);
+                detachSession(session);
                 closeSocket(upstream, code, reason);
             }
         });
@@ -490,7 +512,7 @@ export async function startCodexTuiWebSocketProxy(
                 sessionClosed = true;
                 pendingSelections.clear();
                 resolveUpstreamReady(false);
-                sessions.delete(session);
+                detachSession(session);
                 // The peer may close immediately after writing its final
                 // response. Preserve the admitted response and its selection
                 // callback before mirroring the close to the TUI.
@@ -514,7 +536,7 @@ export async function startCodexTuiWebSocketProxy(
             if (!sessionClosed) {
                 sessionClosed = true;
                 pendingSelections.clear();
-                sessions.delete(session);
+                detachSession(session);
                 closeSocket(upstream);
                 // Match the normal upstream-close path: an already-received
                 // response owns its place in the downstream FIFO even when an
