@@ -174,6 +174,29 @@ function normalizeRawFileChangeList(changes: unknown): LegacyPatchChanges | unde
     return Object.keys(normalized).length > 0 ? normalized : undefined;
 }
 
+/**
+ * Time budget for connectWebSocket() to wait for a freshly-spawned
+ * `codex app-server` to begin accepting WebSocket connections.
+ *
+ * The app-server can be slow to bind its loopback port on a cold start — the
+ * first launch after a reboot, a cold page cache, or bubblewrap/user-namespace
+ * sandbox probing can each push the first successful connect past a few
+ * seconds. The previous 5s budget was too tight for that case and surfaced as
+ * a hard `Timed out connecting to Codex app-server … ECONNREFUSED` error.
+ *
+ * A genuinely crashed app-server still fails fast: connectWebSocket() checks
+ * proc.exitCode / signalCode on each iteration and throws immediately on exit,
+ * so a larger budget only extends the wait for the alive-but-not-yet-listening
+ * (slow-start) case — never for an outright failure.
+ *
+ * Override with HAPPY_CODEX_APP_SERVER_CONNECT_TIMEOUT_MS (positive integer ms).
+ */
+const APP_SERVER_CONNECT_TIMEOUT_MS = ((): number => {
+    const raw = process.env.HAPPY_CODEX_APP_SERVER_CONNECT_TIMEOUT_MS;
+    const parsed = raw !== undefined ? Number.parseInt(raw, 10) : Number.NaN;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 30_000;
+})();
+
 export class CodexAppServerClient {
     private process: ChildProcess | null = null;
     private socket: WebSocket | null = null;
@@ -797,7 +820,7 @@ export class CodexAppServerClient {
     }
 
     private async connectWebSocket(endpoint: string, proc: ChildProcess, epoch: number): Promise<void> {
-        const deadline = Date.now() + 5_000;
+        const deadline = Date.now() + APP_SERVER_CONNECT_TIMEOUT_MS;
         let lastError: Error | null = null;
 
         while (Date.now() < deadline) {
@@ -860,7 +883,7 @@ export class CodexAppServerClient {
             }
         }
 
-        throw new Error(`Timed out connecting to Codex app-server at ${endpoint}: ${lastError?.message ?? 'unknown error'}`);
+        throw new Error(`Timed out connecting to Codex app-server at ${endpoint} after ${APP_SERVER_CONNECT_TIMEOUT_MS}ms: ${lastError?.message ?? 'unknown error'}`);
     }
 
     private async recoverWebSocket(endpoint: string, proc: ChildProcess, epoch: number): Promise<void> {
