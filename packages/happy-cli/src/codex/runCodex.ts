@@ -47,6 +47,10 @@ import { normalizeLocalCodexRolloutEvent } from './codexLocalRolloutState';
 import { LocalTurnCompletionGate } from './localTurnCompletionGate';
 import { sendCodexReadyNotification } from './sendCodexReadyNotification';
 import {
+    routeFreshThreadNotification,
+    routeFreshThreadTurnAccepted,
+} from './freshThreadEventBridge';
+import {
     startCodexTuiWebSocketProxy,
     type CodexTuiSelectionMethod,
 } from './codexTuiWebSocketProxy';
@@ -580,6 +584,28 @@ export async function runCodex(opts: {
                 logger.debug(`[Codex] Native TUI selected ${threadId} via ${method}`);
                 await subscribe(threadId, method, activeTurnId);
             },
+            onTurnAccepted: (turn) => {
+                routeFreshThreadTurnAccepted({
+                    client,
+                    turn,
+                    subscription: {
+                        subscribedThreadId: sharedLocalSubscriptionThreadId,
+                        pendingThreadId: sharedLocalSubscriptionTargetThreadId,
+                        pendingMethod: sharedLocalSubscriptionTargetMethod,
+                    },
+                });
+            },
+            onThreadNotification: (notification) => {
+                routeFreshThreadNotification({
+                    client,
+                    notification,
+                    subscription: {
+                        subscribedThreadId: sharedLocalSubscriptionThreadId,
+                        pendingThreadId: sharedLocalSubscriptionTargetThreadId,
+                        pendingMethod: sharedLocalSubscriptionTargetMethod,
+                    },
+                });
+            },
             onError: (error) => {
                 logger.warn('[Codex] Native TUI WebSocket proxy error', error);
             },
@@ -895,6 +921,7 @@ export async function runCodex(opts: {
 
     let sharedLocalSubscriptionThreadId: string | null = null;
     let sharedLocalSubscriptionTargetThreadId: string | null = null;
+    let sharedLocalSubscriptionTargetMethod: CodexTuiSelectionMethod | null = null;
     let sharedLocalSubscriptionTargetPromise: Promise<void> | null = null;
     let sharedLocalSubscriptionPromise: Promise<void> = Promise.resolve();
     subscribeSharedLocalThread = (
@@ -913,9 +940,10 @@ export async function runCodex(opts: {
         }
 
         const operation = sharedLocalSubscriptionPromise.then(async () => {
-            // A TUI selection response is held by the proxy until this work
-            // finishes, so the selected thread cannot start its first turn
-            // before Happy owns the corresponding app-server subscription.
+            // The proxy holds a TUI selection response until this ownership
+            // transition finishes. Existing threads gain the observer
+            // subscription here; brand-new threads use the selected TUI
+            // connection's mirrored event stream until a later resume.
             const resetLocalThreadState = (): void => {
                 if (currentTurnId) {
                     try {
@@ -933,9 +961,9 @@ export async function runCodex(opts: {
                 sharedLocalTurnCompletionGate.adoptActiveTurn(expectedActiveTurnId ?? null);
                 thinking = false;
             };
-            const commitLocalThreadState = (): void => {
+            const commitLocalThreadState = (subscribed: boolean): void => {
                 activeCodexThreadId = threadId;
-                sharedLocalSubscriptionThreadId = threadId;
+                sharedLocalSubscriptionThreadId = subscribed ? threadId : null;
                 thinking = client.hasActiveTurn();
                 try {
                     session.updateMetadata((currentMetadata) => ({
@@ -956,10 +984,11 @@ export async function runCodex(opts: {
                 // A brand-new thread is not materialized on disk until its
                 // first turn, so a second connection cannot resume it yet.
                 // The proxy-correlated response is authoritative; adopt it
-                // locally before releasing the response to the TUI.
+                // locally and leave observer subscription unset so the proxy
+                // continues mirroring this TUI connection's typed events.
                 resetLocalThreadState();
                 client.adoptThreadSelection(threadId, expectedActiveTurnId);
-                commitLocalThreadState();
+                commitLocalThreadState(false);
                 logger.debug(`[Codex] Happy adopted new local thread ${threadId}`);
                 return;
             }
@@ -969,7 +998,10 @@ export async function runCodex(opts: {
                 currentPermissionMode ?? 'default',
                 client.sandboxEnabled,
             );
-            if (client.threadId !== threadId) {
+            if (
+                client.threadId !== threadId
+                || sharedLocalSubscriptionThreadId !== threadId
+            ) {
                 for (let attempt = 0; ; attempt += 1) {
                     try {
                         await client.resumeThread({
@@ -997,19 +1029,22 @@ export async function runCodex(opts: {
             } else {
                 sharedLocalTurnCompletionGate.adoptActiveTurn(client.turnId);
             }
-            commitLocalThreadState();
+            commitLocalThreadState(true);
             logger.debug(`[Codex] Happy subscribed to active local thread ${threadId}`);
         });
         sharedLocalSubscriptionTargetThreadId = threadId;
+        sharedLocalSubscriptionTargetMethod = method;
         sharedLocalSubscriptionTargetPromise = operation;
         sharedLocalSubscriptionPromise = operation.then(() => {
             if (sharedLocalSubscriptionTargetPromise === operation) {
                 sharedLocalSubscriptionTargetThreadId = null;
+                sharedLocalSubscriptionTargetMethod = null;
                 sharedLocalSubscriptionTargetPromise = null;
             }
         }, (error) => {
             if (sharedLocalSubscriptionTargetPromise === operation) {
                 sharedLocalSubscriptionTargetThreadId = null;
+                sharedLocalSubscriptionTargetMethod = null;
                 sharedLocalSubscriptionTargetPromise = null;
             }
             logger.warn(`[Codex] Could not subscribe to active local thread ${threadId}`, error);

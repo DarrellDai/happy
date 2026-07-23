@@ -816,6 +816,105 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('ingests one exact fresh-root lifecycle from the selected TUI connection', async () => {
+        const proc = createMockProcess({ pid: 3020 });
+        mockSpawn.mockImplementation(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(undefined, {
+            adoptExternalRootThreads: false,
+        });
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((event) => events.push(event as Record<string, unknown>));
+        await client.connect();
+        client.adoptThreadSelection('fresh-root');
+
+        pushJsonLine(proc.stdout, {
+            method: 'thread/status/changed',
+            params: { threadId: 'fresh-root', status: { type: 'idle' } },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        expect(events).toEqual([]);
+        expect(client.adoptThreadTurn('child-root', 'child-turn')).toBe(false);
+        expect(client.adoptThreadTurn('fresh-root', 'fresh-turn')).toBe(true);
+        expect(events.filter((event) => event.type === 'task_started')).toEqual([
+            expect.objectContaining({ type: 'task_started', turn_id: 'fresh-turn' }),
+        ]);
+        expect(client.ingestThreadNotification({
+            threadId: 'fresh-root',
+            method: 'thread/status/changed',
+            params: { threadId: 'fresh-root', status: { type: 'idle' } },
+        })).toBe(false);
+        pushJsonLine(proc.stdout, {
+            method: 'thread/status/changed',
+            params: { threadId: 'fresh-root', status: { type: 'idle' } },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        expect(events.filter((event) => event.type === 'task_complete')).toHaveLength(0);
+        expect(client.ingestThreadNotification({
+            threadId: 'fresh-root',
+            method: 'turn/completed',
+            params: {
+                threadId: 'fresh-root',
+                turn: { status: 'completed', error: null },
+            },
+        })).toBe(false);
+        expect(client.turnId).toBe('fresh-turn');
+        expect(events.filter((event) => event.type === 'task_complete')).toHaveLength(0);
+        expect(client.ingestThreadNotification({
+            threadId: 'child-root',
+            method: 'turn/completed',
+            params: {
+                threadId: 'child-root',
+                turn: { id: 'child-turn', status: 'completed', error: null },
+            },
+        })).toBe(false);
+        expect(client.ingestThreadNotification({
+            threadId: 'fresh-root',
+            method: 'turn/completed',
+            params: {
+                threadId: 'fresh-root',
+                turn: { id: 'fresh-turn', status: 'completed', error: null },
+            },
+        })).toBe(true);
+        expect(client.ingestThreadNotification({
+            threadId: 'fresh-root',
+            method: 'turn/completed',
+            params: {
+                threadId: 'fresh-root',
+                turn: { id: 'fresh-turn', status: 'completed', error: null },
+            },
+        })).toBe(true);
+
+        expect(events.filter((event) => event.type === 'task_complete')).toEqual([
+            expect.objectContaining({ type: 'task_complete', turn_id: 'fresh-turn' }),
+        ]);
+        expect(client.turnId).toBeNull();
+
+        expect(client.adoptThreadTurn('fresh-root', 'older-turn')).toBe(true);
+        expect(client.adoptThreadTurn('fresh-root', 'newer-turn')).toBe(true);
+        expect(client.ingestThreadNotification({
+            threadId: 'fresh-root',
+            method: 'turn/completed',
+            params: {
+                threadId: 'fresh-root',
+                turn: { id: 'older-turn', status: 'completed', error: null },
+            },
+        })).toBe(true);
+        expect(client.turnId).toBe('newer-turn');
+        expect(events.filter((event) => event.type === 'task_complete')).toHaveLength(1);
+        expect(client.ingestThreadNotification({
+            threadId: 'fresh-root',
+            method: 'turn/completed',
+            params: {
+                threadId: 'fresh-root',
+                turn: { id: 'newer-turn', status: 'completed', error: null },
+            },
+        })).toBe(true);
+        expect(events.filter((event) => event.type === 'task_complete')).toHaveLength(2);
+        await client.disconnect();
+    });
+
     it('runs resume commit setup before changing ownership or replaying an active turn', async () => {
         const proc = createMockProcess({
             pid: 3019,

@@ -3,7 +3,9 @@ import WebSocket, { WebSocketServer, type RawData } from 'ws';
 
 import {
     startCodexTuiWebSocketProxy,
+    type CodexTuiThreadNotification,
     type CodexTuiThreadSelection,
+    type CodexTuiTurnAccepted,
     type CodexTuiWebSocketProxy,
 } from './codexTuiWebSocketProxy';
 
@@ -105,6 +107,8 @@ function sendJson(socket: WebSocket, value: unknown): void {
 async function startProxy(opts: {
     targetEndpoint: string;
     onThreadSelected(selection: CodexTuiThreadSelection): void | Promise<void>;
+    onThreadNotification?(notification: CodexTuiThreadNotification): void | Promise<void>;
+    onTurnAccepted?(turn: CodexTuiTurnAccepted): void | Promise<void>;
     onError?(error: Error): void;
     threadStartMcpServers?: Record<string, unknown>;
 }): Promise<CodexTuiWebSocketProxy> {
@@ -293,6 +297,288 @@ describe('startCodexTuiWebSocketProxy', () => {
             response,
             notification,
         ]);
+    });
+
+    it('orders fresh-root turn identity and typed notifications after selection adoption', async () => {
+        const target = await createTargetServer();
+        let releaseTurnAdoption: () => void = () => undefined;
+        const turnAdoptionGate = new Promise<void>((resolve) => {
+            releaseTurnAdoption = resolve;
+        });
+        let markTurnAdoptionStarted: () => void = () => undefined;
+        const turnAdoptionStarted = new Promise<void>((resolve) => {
+            markTurnAdoptionStarted = resolve;
+        });
+        const order: string[] = [];
+        const turns: CodexTuiTurnAccepted[] = [];
+        const notifications: CodexTuiThreadNotification[] = [];
+        const proxy = await startProxy({
+            targetEndpoint: target.endpoint,
+            onThreadSelected: (selection) => {
+                order.push(`selected:${selection.threadId}`);
+            },
+            onTurnAccepted: async (turn) => {
+                turns.push(turn);
+                order.push(`turn:${turn.turnId}`);
+                markTurnAdoptionStarted();
+                await turnAdoptionGate;
+            },
+            onThreadNotification: (notification) => {
+                notifications.push(notification);
+                order.push(`notification:${notification.method}`);
+            },
+        });
+        const upstreamConnection = nextConnection(target.server);
+        const tui = await connect(proxy.endpoint);
+        const upstream = await upstreamConnection;
+
+        const selectionRequest = collectFrames(upstream, 1);
+        sendJson(tui, { jsonrpc: '2.0', id: 51, method: 'thread/start', params: {} });
+        await selectionRequest;
+        const selectionResponse = collectFrames(tui, 1);
+        sendJson(upstream, {
+            jsonrpc: '2.0',
+            id: 51,
+            result: { thread: { id: 'fresh-root', parentThreadId: null, turns: [] } },
+        });
+        await selectionResponse;
+
+        const turnRequest = collectFrames(upstream, 1);
+        sendJson(tui, {
+            jsonrpc: '2.0',
+            id: 52,
+            method: 'turn/start',
+            params: { threadId: 'fresh-root', input: [] },
+        });
+        await turnRequest;
+
+        const receivedByTui: string[] = [];
+        tui.on('message', (data) => receivedByTui.push(copyData(data).toString('utf8')));
+        const forwarded = collectFrames(tui, 3);
+        const turnResponse = {
+            jsonrpc: '2.0',
+            id: 52,
+            result: { turn: { id: 'fresh-turn', status: 'inProgress' } },
+        };
+        const laterNotification = {
+            jsonrpc: '2.0',
+            method: 'turn/started',
+            params: {
+                threadId: 'fresh-root',
+                turn: { id: 'fresh-turn', status: 'inProgress' },
+            },
+        };
+        const completion = {
+            jsonrpc: '2.0',
+            method: 'turn/completed',
+            params: {
+                threadId: 'fresh-root',
+                turn: { id: 'fresh-turn', status: 'completed', error: null },
+            },
+        };
+        sendJson(upstream, turnResponse);
+        sendJson(upstream, laterNotification);
+        sendJson(upstream, completion);
+
+        await turnAdoptionStarted;
+        const upstreamClosed = waitForClose(upstream);
+        upstream.close();
+        await upstreamClosed;
+        expect(order).toEqual(['selected:fresh-root', 'turn:fresh-turn']);
+        expect(turns).toEqual([{ threadId: 'fresh-root', turnId: 'fresh-turn' }]);
+        expect(receivedByTui).toEqual([]);
+
+        let idleSettled = false;
+        const idle = proxy.waitForIdle().then(() => {
+            idleSettled = true;
+        });
+        await Promise.resolve();
+        expect(idleSettled).toBe(false);
+
+        releaseTurnAdoption();
+        const frames = await forwarded;
+        await idle;
+        expect(frames.map((frame) => JSON.parse(frame.data.toString('utf8')))).toEqual([
+            turnResponse,
+            laterNotification,
+            completion,
+        ]);
+        expect(notifications).toEqual([
+            {
+                threadId: 'fresh-root',
+                method: 'turn/started',
+                params: laterNotification.params,
+            },
+            {
+                threadId: 'fresh-root',
+                method: 'turn/completed',
+                params: completion.params,
+            },
+        ]);
+        expect(order).toEqual([
+            'selected:fresh-root',
+            'turn:fresh-turn',
+            'notification:turn/started',
+            'notification:turn/completed',
+        ]);
+    });
+
+    it('rejects unowned fresh-thread events and keeps forwarding after callback failure', async () => {
+        const target = await createTargetServer();
+        const callbackError = new Error('observer callback failed');
+        const onError = vi.fn();
+        const turns: CodexTuiTurnAccepted[] = [];
+        const notifications: CodexTuiThreadNotification[] = [];
+        const proxy = await startProxy({
+            targetEndpoint: target.endpoint,
+            onThreadSelected: vi.fn(),
+            onTurnAccepted: (turn) => {
+                turns.push(turn);
+            },
+            onThreadNotification: (notification) => {
+                notifications.push(notification);
+                if (notification.method === 'turn/started') {
+                    throw callbackError;
+                }
+            },
+            onError,
+        });
+        const upstreamConnection = nextConnection(target.server);
+        const tui = await connect(proxy.endpoint);
+        const upstream = await upstreamConnection;
+
+        const selectionRequest = collectFrames(upstream, 1);
+        sendJson(tui, { jsonrpc: '2.0', id: 61, method: 'thread/start', params: {} });
+        await selectionRequest;
+        const selectionResponse = collectFrames(tui, 1);
+        sendJson(upstream, {
+            jsonrpc: '2.0', id: 61,
+            result: { thread: { id: 'fresh-root', parentThreadId: null, turns: [] } },
+        });
+        await selectionResponse;
+
+        const requests = collectFrames(upstream, 5);
+        sendJson(tui, {
+            jsonrpc: '2.0', id: 62, method: 'turn/start',
+            params: { threadId: 'child-root', input: [] },
+        });
+        sendJson(tui, {
+            jsonrpc: '2.0', id: 63, method: 'turn/start',
+            params: { threadId: 'fresh-root', input: [] },
+        });
+        sendJson(tui, {
+            jsonrpc: '2.0', id: 65, method: 'turn/start',
+            params: { threadId: 'fresh-root', input: [] },
+        });
+        sendJson(tui, {
+            jsonrpc: '2.0', id: 66, method: 'turn/start',
+            params: { threadId: 'fresh-root', input: [] },
+        });
+        sendJson(tui, {
+            jsonrpc: '2.0', id: 67, method: 'turn/start',
+            params: { threadId: 'fresh-root', input: [] },
+        });
+        await requests;
+
+        const responses = collectFrames(tui, 11);
+        sendJson(upstream, {
+            jsonrpc: '2.0', id: 62,
+            result: { turn: { id: 'child-turn', status: 'inProgress' } },
+        });
+        sendJson(upstream, {
+            jsonrpc: '2.0', id: 63,
+            result: { turn: { id: 'fresh-turn', status: 'inProgress' } },
+        });
+        sendJson(upstream, {
+            jsonrpc: '2.0', id: 65,
+            error: { code: -32600, message: 'turn rejected' },
+        });
+        sendJson(upstream, {
+            jsonrpc: '2.0', id: 66,
+            result: {},
+        });
+        sendJson(upstream, {
+            jsonrpc: '2.0', id: 67,
+            result: { turn: { id: 'accepted-once', status: 'inProgress' } },
+        });
+        sendJson(upstream, {
+            jsonrpc: '2.0', id: 67,
+            result: { turn: { id: 'duplicate-response', status: 'inProgress' } },
+        });
+        sendJson(upstream, {
+            jsonrpc: '2.0', id: 999,
+            result: { turn: { id: 'unmatched-response', status: 'inProgress' } },
+        });
+        sendJson(upstream, {
+            jsonrpc: '2.0', method: 'turn/started',
+            params: {
+                threadId: 'child-root',
+                turn: { id: 'child-turn', status: 'inProgress' },
+            },
+        });
+        sendJson(upstream, {
+            jsonrpc: '2.0', method: 'thread/status/changed',
+            params: { threadId: 'fresh-root', status: { type: 'idle' } },
+        });
+        sendJson(upstream, {
+            jsonrpc: '2.0', method: 'turn/started',
+            params: {
+                threadId: 'fresh-root',
+                turn: { id: 'fresh-turn', status: 'inProgress' },
+            },
+        });
+        sendJson(upstream, {
+            jsonrpc: '2.0', method: 'turn/completed',
+            params: {
+                threadId: 'fresh-root',
+                turn: { id: 'fresh-turn', status: 'completed', error: null },
+            },
+        });
+        await responses;
+        await proxy.waitForIdle();
+
+        expect(turns).toEqual([
+            { threadId: 'fresh-root', turnId: 'fresh-turn' },
+            { threadId: 'fresh-root', turnId: 'accepted-once' },
+        ]);
+        expect(notifications.map((notification) => notification.method)).toEqual([
+            'turn/started',
+            'turn/completed',
+        ]);
+        expect(onError).toHaveBeenCalledWith(callbackError);
+
+        const reselectionRequest = collectFrames(upstream, 1);
+        sendJson(tui, { jsonrpc: '2.0', id: 64, method: 'thread/resume', params: {} });
+        await reselectionRequest;
+        const laterFrames = collectFrames(tui, 4);
+        sendJson(upstream, {
+            jsonrpc: '2.0', id: 64,
+            result: { thread: { id: 'resumed-root', parentThreadId: null, turns: [] } },
+        });
+        sendJson(upstream, {
+            jsonrpc: '2.0', method: 'turn/completed',
+            params: {
+                threadId: 'fresh-root',
+                turn: { id: 'late-fresh-turn', status: 'completed', error: null },
+            },
+        });
+        sendJson(upstream, {
+            jsonrpc: '2.0', method: 'turn/started',
+            params: {
+                threadId: 'resumed-root',
+                turn: { id: 'resumed-turn', status: 'inProgress' },
+            },
+        });
+        sendJson(upstream, {
+            jsonrpc: '2.0', method: 'turn/completed',
+            params: {
+                threadId: 'resumed-root',
+                turn: { id: 'resumed-turn', status: 'completed', error: null },
+            },
+        });
+        await laterFrames;
+        await proxy.waitForIdle();
+        expect(notifications).toHaveLength(2);
     });
 
     it('correlates start, resume, and fork responses by string or numeric id', async () => {

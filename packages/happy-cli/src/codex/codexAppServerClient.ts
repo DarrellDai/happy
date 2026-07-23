@@ -239,6 +239,7 @@ export class CodexAppServerClient {
     private rawStartedTurnIds = new Set<string>();
     private rawFileChangesByItemId = new Map<string, LegacyPatchChanges>();
     private rawUserMessageItemIds = new Set<string>();
+    private proxiedTurnId: string | null = null;
     private turnIdleWaiters = new Set<() => void>();
 
     // Handlers set by the consumer (runCodex.ts)
@@ -395,13 +396,17 @@ export class CodexAppServerClient {
         this.emitRawTaskStarted(activeTurn.id);
     }
 
-    private shouldHandleRawNotification(method: string): boolean {
-        const isRawNotification = method === 'thread/started'
+    private isRawNotificationMethod(method: string): boolean {
+        return method === 'thread/started'
             || method === 'turn/started'
             || method === 'turn/completed'
             || method === 'thread/status/changed'
             || method === 'thread/tokenUsage/updated'
             || method.startsWith('item/');
+    }
+
+    private shouldHandleRawNotification(method: string): boolean {
+        const isRawNotification = this.isRawNotificationMethod(method);
 
         if (!isRawNotification) {
             return false;
@@ -474,13 +479,23 @@ export class CodexAppServerClient {
             return;
         }
         this._turnId = null;
+        if (!turnId || this.proxiedTurnId === turnId) {
+            this.proxiedTurnId = null;
+        }
         for (const resolve of this.turnIdleWaiters) resolve();
         this.turnIdleWaiters.clear();
     }
 
-    private handleRawNotification(method: string, params: any): boolean {
-        if (!this.shouldHandleRawNotification(method)) {
+    private handleRawNotification(method: string, params: any, force: boolean = false): boolean {
+        if (
+            force
+                ? !this.isRawNotificationMethod(method)
+                : !this.shouldHandleRawNotification(method)
+        ) {
             return false;
+        }
+        if (force && this.notificationProtocol === 'unknown') {
+            this.notificationProtocol = 'raw';
         }
 
         if (method === 'thread/started') {
@@ -554,7 +569,11 @@ export class CodexAppServerClient {
                     thread_id: this._threadId,
                 });
             }
-            if (statusType === 'idle' && this._turnId) {
+            if (
+                statusType === 'idle'
+                && this._turnId
+                && this._turnId !== this.proxiedTurnId
+            ) {
                 this.emitRawTurnCompletion(this._turnId, 'completed', null, method);
             }
             return true;
@@ -1229,10 +1248,66 @@ export class CodexAppServerClient {
         }
         this._threadId = threadId;
         this._turnId = activeTurnId ?? null;
+        this.proxiedTurnId = null;
         if (activeTurnId) {
             this.markPendingTurnStarted(activeTurnId);
         }
         logger.debug('[CodexAppServer] Adopted connection-scoped thread:', threadId);
+    }
+
+    /**
+     * Seed a turn accepted by the selected TUI connection. Codex may omit the
+     * matching `turn/started` notification for a fast turn, so the correlated
+     * response is the authoritative fallback identity.
+     */
+    adoptThreadTurn(threadId: string, turnId: string): boolean {
+        if (!threadId || !turnId || this._threadId !== threadId) {
+            logger.debug(
+                `[CodexAppServer] Ignoring adopted turn ${turnId || '<empty>'} for non-owned thread ${threadId || '<empty>'}`,
+            );
+            return false;
+        }
+        this.proxiedTurnId = turnId;
+        this.emitRawTaskStarted(turnId);
+        return true;
+    }
+
+    /**
+     * Ingest a typed notification from the selected fresh TUI connection.
+     * Only explicit, owned-root turn/item notifications are accepted; global
+     * status broadcasts cannot synthesize a completion through this seam.
+     */
+    ingestThreadNotification(notification: {
+        threadId: string;
+        method: string;
+        params: Record<string, unknown>;
+    }): boolean {
+        const { threadId, method, params } = notification;
+        const lifecycleTurnId = method === 'turn/started' || method === 'turn/completed'
+            ? (params.turn as { id?: unknown } | null | undefined)?.id
+            : null;
+        if (
+            this._threadId !== threadId
+            || params.threadId !== threadId
+            || (
+                (method === 'turn/started' || method === 'turn/completed')
+                && (typeof lifecycleTurnId !== 'string' || lifecycleTurnId.length === 0)
+            )
+            || !(
+                method === 'turn/started'
+                || method === 'turn/completed'
+                || method === 'thread/tokenUsage/updated'
+                || method.startsWith('item/')
+            )
+        ) {
+            logger.debug(`[CodexAppServer] Ignoring proxied ${method} for non-owned thread ${threadId}`);
+            return false;
+        }
+        const handled = this.handleRawNotification(method, params, true);
+        if (handled) {
+            logger.debug(`[CodexAppServer] Proxied fresh-thread notification: ${method}`);
+        }
+        return handled;
     }
 
     async startThread(opts: {
@@ -1261,6 +1336,7 @@ export class CodexAppServerClient {
         const result = await this.request('thread/start', params) as NewConversationResponse;
         this._threadId = result.thread.id;
         this._turnId = null;
+        this.proxiedTurnId = null;
         this.rememberThreadDefaults(opts);
         logger.debug('[CodexAppServer] Thread started:', this._threadId);
         return { threadId: result.thread.id, model: result.model };
@@ -1307,6 +1383,7 @@ export class CodexAppServerClient {
         opts?.beforeEventReplay?.();
         this._threadId = result.thread.id;
         this._turnId = result.thread.id === threadId ? activeTurnId : null;
+        this.proxiedTurnId = null;
         this.reconcileTurnStateFromThread(
             result.thread,
             result.thread.id === threadId ? activeTurnId : null,

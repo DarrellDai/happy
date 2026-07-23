@@ -14,6 +14,17 @@ export type CodexTuiThreadSelection = {
     activeTurnId?: string;
 };
 
+export type CodexTuiThreadNotification = {
+    threadId: string;
+    method: string;
+    params: Record<string, unknown>;
+};
+
+export type CodexTuiTurnAccepted = {
+    threadId: string;
+    turnId: string;
+};
+
 export type CodexTuiWebSocketProxy = {
     endpoint: string;
     waitForIdle(): Promise<void>;
@@ -23,6 +34,10 @@ export type CodexTuiWebSocketProxy = {
 export type StartCodexTuiWebSocketProxyOptions = {
     targetEndpoint: string;
     onThreadSelected(selection: CodexTuiThreadSelection): void | Promise<void>;
+    /** Mirrors the typed event stream owned by a freshly started TUI thread. */
+    onThreadNotification?(notification: CodexTuiThreadNotification): void | Promise<void>;
+    /** Seeds root-turn identity even when Codex omits `turn/started`. */
+    onTurnAccepted?(turn: CodexTuiTurnAccepted): void | Promise<void>;
     onError?(error: Error): void;
     /** Session-scoped MCP servers merged into native-TUI `thread/start` requests. */
     threadStartMcpServers?: Record<string, unknown>;
@@ -34,9 +49,28 @@ type PendingSelection = {
     method: CodexTuiSelectionMethod;
 };
 
-type CorrelatedSelection = {
-    id: JsonRpcId;
-    selection: CodexTuiThreadSelection;
+type PendingFreshThreadTurn = {
+    threadId: string;
+};
+
+type CorrelatedServerEvent =
+    | {
+        type: 'selection';
+        id: JsonRpcId;
+        selection: CodexTuiThreadSelection;
+    }
+    | {
+        type: 'notification';
+        notification: CodexTuiThreadNotification;
+    }
+    | {
+        type: 'turn-accepted';
+        turn: CodexTuiTurnAccepted;
+    };
+
+type ActiveFreshThreadSelection = {
+    connection: symbol;
+    threadId: string;
 };
 
 type QueuedFrame = {
@@ -115,6 +149,40 @@ function trackSelectionRequests(
     }
 }
 
+function trackFreshThreadTurnRequests(
+    frame: QueuedFrame,
+    pendingTurns: Map<JsonRpcId, PendingFreshThreadTurn>,
+    activeSelection: ActiveFreshThreadSelection | null,
+    connection: symbol,
+): void {
+    for (const message of jsonRpcMessages(parseJsonFrame(frame))) {
+        if (typeof message.method !== 'string') {
+            continue;
+        }
+        const id = jsonRpcId(message.id);
+        if (id === null) {
+            continue;
+        }
+
+        pendingTurns.delete(id);
+        if (
+            message.method !== 'turn/start'
+            || !activeSelection
+            || activeSelection.connection !== connection
+        ) {
+            continue;
+        }
+        const params = message.params;
+        if (params === null || typeof params !== 'object' || Array.isArray(params)) {
+            continue;
+        }
+        const threadId = (params as Record<string, unknown>).threadId;
+        if (threadId === activeSelection.threadId) {
+            pendingTurns.set(id, { threadId });
+        }
+    }
+}
+
 function injectThreadStartMcpServers(
     frame: QueuedFrame,
     mcpServers: Record<string, unknown> | undefined,
@@ -172,12 +240,42 @@ function injectThreadStartMcpServers(
     };
 }
 
-function consumeThreadSelections(
+function isMirroredThreadNotification(method: string): boolean {
+    return method === 'turn/started'
+        || method === 'turn/completed'
+        || method === 'thread/tokenUsage/updated'
+        || method.startsWith('item/');
+}
+
+function consumeCorrelatedServerEvents(
     frame: QueuedFrame,
     pendingSelections: Map<JsonRpcId, PendingSelection>,
-): CorrelatedSelection[] {
-    const selections: CorrelatedSelection[] = [];
+    pendingTurns: Map<JsonRpcId, PendingFreshThreadTurn>,
+): CorrelatedServerEvent[] {
+    const events: CorrelatedServerEvent[] = [];
     for (const message of jsonRpcMessages(parseJsonFrame(frame))) {
+        if (
+            typeof message.method === 'string'
+            && message.id === undefined
+            && isMirroredThreadNotification(message.method)
+            && message.params !== null
+            && typeof message.params === 'object'
+            && !Array.isArray(message.params)
+        ) {
+            const params = message.params as Record<string, unknown>;
+            if (typeof params.threadId === 'string' && params.threadId.length > 0) {
+                events.push({
+                    type: 'notification',
+                    notification: {
+                        threadId: params.threadId,
+                        method: message.method,
+                        params,
+                    },
+                });
+            }
+            continue;
+        }
+
         // A server request can use the same id as a client request because the
         // two directions have independent request namespaces. Only response
         // envelopes (which have no method) can complete a selection request.
@@ -186,6 +284,30 @@ function consumeThreadSelections(
         }
         const id = jsonRpcId(message.id);
         if (id === null) {
+            continue;
+        }
+        const pendingTurn = pendingTurns.get(id);
+        if (pendingTurn) {
+            pendingTurns.delete(id);
+            if (message.error !== undefined) {
+                continue;
+            }
+            const result = message.result;
+            const turn = result !== null && typeof result === 'object' && !Array.isArray(result)
+                ? (result as Record<string, unknown>).turn
+                : null;
+            const turnId = turn !== null && typeof turn === 'object' && !Array.isArray(turn)
+                ? (turn as Record<string, unknown>).id
+                : null;
+            if (typeof turnId === 'string' && turnId.length > 0) {
+                events.push({
+                    type: 'turn-accepted',
+                    turn: {
+                        threadId: pendingTurn.threadId,
+                        turnId,
+                    },
+                });
+            }
             continue;
         }
         const pending = pendingSelections.get(id);
@@ -220,7 +342,8 @@ function consumeThreadSelections(
             && (turn as Record<string, unknown>).status === 'inProgress'
             && typeof (turn as Record<string, unknown>).id === 'string'
         )) as Record<string, unknown> | undefined;
-        selections.push({
+        events.push({
+            type: 'selection',
             id,
             selection: {
                 threadId: threadRecord.id,
@@ -229,7 +352,7 @@ function consumeThreadSelections(
             },
         });
     }
-    return selections;
+    return events;
 }
 
 function replaceFailedSelectionResponses(
@@ -310,8 +433,9 @@ async function sendFrame(socket: WebSocket, frame: QueuedFrame): Promise<void> {
 
 /**
  * Start a connection-scoped relay for a Codex TUI attached to a shared
- * app-server. Selection is derived only from successful request/response pairs
- * observed on the same downstream connection.
+ * app-server. Selection and root-turn identity are derived only from
+ * successful request/response pairs observed on the same downstream
+ * connection. Fresh-thread typed events retain that connection provenance.
  */
 export async function startCodexTuiWebSocketProxy(
     opts: StartCodexTuiWebSocketProxyOptions,
@@ -328,7 +452,8 @@ export async function startCodexTuiWebSocketProxy(
     const sessions = new Set<RelaySession>();
     const upstreamSockets = new Set<WebSocket>();
     const inFlightServerFrames = new Set<Promise<void>>();
-    let selectionTransactionTail = Promise.resolve();
+    let lifecycleTransactionTail = Promise.resolve();
+    let activeFreshThreadSelection: ActiveFreshThreadSelection | null = null;
     let proxyClosing = false;
     let closePromise: Promise<void> | null = null;
 
@@ -364,7 +489,9 @@ export async function startCodexTuiWebSocketProxy(
         // in-TUI picker. Correlation remains connection-scoped below, while
         // selection adoption is serialized proxy-wide.
 
+        const connection = Symbol('codex-tui-proxy-connection');
         const pendingSelections = new Map<JsonRpcId, PendingSelection>();
+        const pendingFreshThreadTurns = new Map<JsonRpcId, PendingFreshThreadTurn>();
         let upstream: WebSocket;
         try {
             upstream = new WebSocket(opts.targetEndpoint);
@@ -382,6 +509,21 @@ export async function startCodexTuiWebSocketProxy(
         });
         let clientToServerTail = Promise.resolve();
         let serverToClientTail = Promise.resolve();
+        let freshSelectionReleaseScheduled = false;
+
+        const scheduleFreshSelectionRelease = (): void => {
+            if (freshSelectionReleaseScheduled) {
+                return;
+            }
+            freshSelectionReleaseScheduled = true;
+            const release = lifecycleTransactionTail.then(() => {
+                if (activeFreshThreadSelection?.connection === connection) {
+                    activeFreshThreadSelection = null;
+                }
+            });
+            lifecycleTransactionTail = release;
+            trackServerFrame(release);
+        };
 
         const resolveUpstreamReady = (ready: boolean): void => {
             if (upstreamReadySettled) {
@@ -401,6 +543,8 @@ export async function startCodexTuiWebSocketProxy(
                 }
                 sessionClosed = true;
                 pendingSelections.clear();
+                pendingFreshThreadTurns.clear();
+                scheduleFreshSelectionRelease();
                 resolveUpstreamReady(false);
                 detachSession(session);
                 closeSocket(downstream);
@@ -410,6 +554,8 @@ export async function startCodexTuiWebSocketProxy(
                 if (!sessionClosed) {
                     sessionClosed = true;
                     pendingSelections.clear();
+                    pendingFreshThreadTurns.clear();
+                    scheduleFreshSelectionRelease();
                     resolveUpstreamReady(false);
                     detachSession(session);
                 }
@@ -429,6 +575,12 @@ export async function startCodexTuiWebSocketProxy(
                 opts.threadStartMcpServers,
             );
             trackSelectionRequests(frame, pendingSelections);
+            trackFreshThreadTurnRequests(
+                frame,
+                pendingFreshThreadTurns,
+                activeFreshThreadSelection,
+                connection,
+            );
             clientToServerTail = clientToServerTail.then(async () => {
                 const ready = await upstreamReady;
                 if (!ready || sessionClosed) {
@@ -447,17 +599,21 @@ export async function startCodexTuiWebSocketProxy(
         upstream.on('message', (data, isBinary) => {
             const frame = copyFrame(data, isBinary);
             // Consume correlation synchronously so a subsequent socket close
-            // cannot discard a response that has already arrived. Selection
-            // transactions are also reserved here, in response-observation
-            // order, rather than later when this connection's FIFO is ready.
-            const selections = consumeThreadSelections(frame, pendingSelections);
+            // cannot discard a response that has already arrived. Ownership
+            // and fresh-thread event transactions are reserved here, in
+            // server-frame observation order, before a connection FIFO waits.
+            const correlatedEvents = consumeCorrelatedServerEvents(
+                frame,
+                pendingSelections,
+                pendingFreshThreadTurns,
+            );
             const priorConnectionTail = serverToClientTail;
             const forwardToTui = (outboundFrame: QueuedFrame): Promise<void> => (
                 sendFrame(downstream, outboundFrame)
             );
 
             let task: Promise<void>;
-            if (selections.length === 0) {
+            if (correlatedEvents.length === 0) {
                 task = priorConnectionTail.then(() => forwardToTui(frame)).catch((error) => {
                     if (!sessionClosed && !proxyClosing) {
                         reportError(error, 'Failed to forward a Codex app-server message to the TUI');
@@ -467,18 +623,66 @@ export async function startCodexTuiWebSocketProxy(
                 // Codex selects on a new main connection after the startup
                 // picker, but uses the existing main connection after an
                 // in-TUI picker. Every connection is therefore selection-
-                // capable. Serialize the complete adoption/response exchange
-                // proxy-wide while retaining each connection's own FIFO and
-                // request-id namespace.
-                const transaction = selectionTransactionTail.then(async () => {
+                // capable. Serialize selections, accepted root turns, and
+                // fresh-thread events proxy-wide while retaining each
+                // connection's FIFO and request-id namespace.
+                const transaction = lifecycleTransactionTail.then(async () => {
                     await priorConnectionTail;
                     const failedSelectionIds = new Set<JsonRpcId>();
-                    for (const correlated of selections) {
+                    for (const correlated of correlatedEvents) {
+                        if (correlated.type === 'selection') {
+                            try {
+                                await opts.onThreadSelected(correlated.selection);
+                                activeFreshThreadSelection = correlated.selection.method === 'thread/start'
+                                    && (opts.onThreadNotification || opts.onTurnAccepted)
+                                    ? {
+                                        connection,
+                                        threadId: correlated.selection.threadId,
+                                    }
+                                    : null;
+                            } catch (error) {
+                                failedSelectionIds.add(correlated.id);
+                                reportError(error, `Failed to adopt Codex thread ${correlated.selection.threadId}`);
+                            }
+                            continue;
+                        }
+
+                        const activeSelection = activeFreshThreadSelection;
+                        if (
+                            !activeSelection
+                            || activeSelection.connection !== connection
+                        ) {
+                            continue;
+                        }
+
+                        if (correlated.type === 'turn-accepted') {
+                            if (
+                                correlated.turn.threadId !== activeSelection.threadId
+                                || !opts.onTurnAccepted
+                            ) {
+                                continue;
+                            }
+                            try {
+                                await opts.onTurnAccepted(correlated.turn);
+                            } catch (error) {
+                                reportError(error, `Failed to adopt Codex turn ${correlated.turn.turnId}`);
+                            }
+                            continue;
+                        }
+
+                        if (
+                            correlated.notification.threadId !== activeSelection.threadId
+                            || !opts.onThreadNotification
+                        ) {
+                            continue;
+                        }
                         try {
-                            await opts.onThreadSelected(correlated.selection);
+                            await opts.onThreadNotification(correlated.notification);
                         } catch (error) {
-                            failedSelectionIds.add(correlated.id);
-                            reportError(error, `Failed to adopt Codex thread ${correlated.selection.threadId}`);
+                            reportError(
+                                error,
+                                `Failed to mirror ${correlated.notification.method} for ${correlated.notification.threadId}`,
+                            );
                         }
                     }
                     await forwardToTui(replaceFailedSelectionResponses(frame, failedSelectionIds));
@@ -488,10 +692,10 @@ export async function startCodexTuiWebSocketProxy(
                 // reports the original unexpected failure before recovering.
                 task = transaction.catch((error) => {
                     if (!sessionClosed && !proxyClosing) {
-                        reportError(error, 'Failed to deliver a Codex thread-selection response to the TUI');
+                        reportError(error, 'Failed to deliver a correlated Codex app-server frame to the TUI');
                     }
                 });
-                selectionTransactionTail = task;
+                lifecycleTransactionTail = task;
             }
             serverToClientTail = task;
             trackServerFrame(task);
@@ -501,6 +705,8 @@ export async function startCodexTuiWebSocketProxy(
             if (!sessionClosed) {
                 sessionClosed = true;
                 pendingSelections.clear();
+                pendingFreshThreadTurns.clear();
+                scheduleFreshSelectionRelease();
                 resolveUpstreamReady(false);
                 detachSession(session);
                 closeSocket(upstream, code, reason);
@@ -511,6 +717,8 @@ export async function startCodexTuiWebSocketProxy(
             if (!sessionClosed) {
                 sessionClosed = true;
                 pendingSelections.clear();
+                pendingFreshThreadTurns.clear();
+                scheduleFreshSelectionRelease();
                 resolveUpstreamReady(false);
                 detachSession(session);
                 // The peer may close immediately after writing its final
@@ -536,6 +744,8 @@ export async function startCodexTuiWebSocketProxy(
             if (!sessionClosed) {
                 sessionClosed = true;
                 pendingSelections.clear();
+                pendingFreshThreadTurns.clear();
+                scheduleFreshSelectionRelease();
                 detachSession(session);
                 closeSocket(upstream);
                 // Match the normal upstream-close path: an already-received
