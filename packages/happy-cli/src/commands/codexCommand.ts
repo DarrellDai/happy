@@ -25,6 +25,7 @@ export async function handleCodexCommand(args: string[]): Promise<void> {
     noSandbox: sandboxArgs.noSandbox,
     resumeThreadId: codexArgs.resumeThreadId ?? undefined,
     nativeResumeArgs: codexArgs.nativeResumeArgs,
+    nativeForkArgs: codexArgs.nativeForkArgs,
     startingMode: codexArgs.startingMode,
     permissionMode: permissionArgs.permissionMode,
   })

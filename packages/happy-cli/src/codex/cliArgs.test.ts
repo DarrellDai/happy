@@ -170,6 +170,33 @@ describe('extractCodexResumeFlag', () => {
         });
     });
 
+    it('preserves native fork syntax for a picker, flags, thread ID, and prompt', () => {
+        expect(extractCodexResumeFlag(['fork'])).toEqual({
+            resumeThreadId: null,
+            nativeForkArgs: [],
+            args: [],
+        });
+        expect(extractCodexResumeFlag([
+            '--started-by',
+            'terminal',
+            'fork',
+            '--last',
+        ])).toEqual({
+            resumeThreadId: null,
+            nativeForkArgs: ['--last'],
+            args: ['--started-by', 'terminal'],
+        });
+        expect(extractCodexResumeFlag([
+            'fork',
+            'thread-positional',
+            'try another approach',
+        ])).toEqual({
+            resumeThreadId: null,
+            nativeForkArgs: ['thread-positional', 'try another approach'],
+            args: [],
+        });
+    });
+
     it('supports equals syntax', () => {
         const parsed = extractCodexResumeFlag(['--resume=thread-456', '--started-by', 'terminal']);
 
@@ -210,6 +237,12 @@ describe('extractCodexResumeFlag', () => {
     it('rejects combining positional and flag resume forms', () => {
         expect(() => extractCodexResumeFlag(['resume', '--resume', 'thread-123'])).toThrow(
             'Codex resume flag can only be provided once.',
+        );
+    });
+
+    it('rejects combining a native fork command with the Happy resume flag', () => {
+        expect(() => extractCodexResumeFlag(['fork', '--resume', 'thread-123'])).toThrow(
+            'Codex resume and fork commands cannot be combined.',
         );
     });
 });

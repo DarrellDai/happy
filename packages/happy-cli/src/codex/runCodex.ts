@@ -79,6 +79,7 @@ export async function runCodex(opts: {
     noSandbox?: boolean;
     resumeThreadId?: string;
     nativeResumeArgs?: string[];
+    nativeForkArgs?: string[];
     startingMode?: CodexStartingMode;
     permissionMode?: CodexPermissionMode;
 }): Promise<void> {
@@ -198,6 +199,7 @@ export async function runCodex(opts: {
     let currentRunMode = initialRunMode;
     let activeCodexThreadId = opts.resumeThreadId;
     let nativeResumeArgsPending = opts.nativeResumeArgs;
+    let nativeForkArgsPending = opts.nativeForkArgs;
     let thinking = false;
     const { session: initialSession, reconnectionHandle } = setupOfflineReconnection({
         api,
@@ -665,6 +667,7 @@ export async function runCodex(opts: {
                 codexHomeDir: process.env.CODEX_HOME,
                 codexThreadId,
                 nativeResumeArgs: !codexThreadId ? nativeResumeArgsPending : undefined,
+                nativeForkArgs: !codexThreadId ? nativeForkArgsPending : undefined,
                 remoteEndpoint: useSharedAppServer ? await ensureSharedTuiProxyEndpoint() : undefined,
                 // The shared app-server already owns Happy's external sandbox.
                 // Wrapping the disposable remote TUI again would create a
@@ -698,6 +701,7 @@ export async function runCodex(opts: {
                 },
             });
             nativeResumeArgsPending = undefined;
+            nativeForkArgsPending = undefined;
             // Seal this launch's connection-scoped selector before changing
             // modes. close() waits for an in-flight selection callback, so a
             // terminated TUI cannot mutate ownership later in remote mode.

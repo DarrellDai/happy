@@ -100,6 +100,41 @@ describe('buildCodexNativeArgs', () => {
         ]);
     });
 
+    it('opens the native fork picker against the shared app-server', () => {
+        expect(buildCodexNativeArgs({
+            nativeForkArgs: [],
+            remoteEndpoint: 'ws://127.0.0.1:43210',
+            permissionMode: 'yolo',
+        })).toEqual([
+            '--remote',
+            'ws://127.0.0.1:43210',
+            'fork',
+            '--ask-for-approval',
+            'never',
+            '--sandbox',
+            'danger-full-access',
+        ]);
+    });
+
+    it('forwards native fork target, picker flags, and prompt', () => {
+        expect(buildCodexNativeArgs({
+            nativeForkArgs: ['thread-123', '--all', 'try another approach'],
+            remoteEndpoint: 'ws://127.0.0.1:43210',
+            permissionMode: 'yolo',
+        })).toEqual([
+            '--remote',
+            'ws://127.0.0.1:43210',
+            'fork',
+            'thread-123',
+            '--all',
+            'try another approach',
+            '--ask-for-approval',
+            'never',
+            '--sandbox',
+            'danger-full-access',
+        ]);
+    });
+
     it('forwards native resume target, picker flags, and prompt', () => {
         expect(buildCodexNativeArgs({
             nativeResumeArgs: ['thread-123', '--all', 'continue now'],

@@ -49,6 +49,7 @@ describe('handleCodexCommand', () => {
       noSandbox: false,
       resumeThreadId: undefined,
       nativeResumeArgs: undefined,
+      nativeForkArgs: undefined,
       startingMode: undefined,
       permissionMode: undefined,
     })
@@ -86,6 +87,7 @@ describe('handleCodexCommand', () => {
       noSandbox: true,
       resumeThreadId: 'thread-123',
       nativeResumeArgs: undefined,
+      nativeForkArgs: undefined,
       startingMode: 'remote',
       permissionMode: undefined,
     })
@@ -107,6 +109,7 @@ describe('handleCodexCommand', () => {
       noSandbox: false,
       resumeThreadId: undefined,
       nativeResumeArgs: undefined,
+      nativeForkArgs: undefined,
       startingMode: undefined,
       permissionMode: 'yolo',
     })
@@ -127,6 +130,7 @@ describe('handleCodexCommand', () => {
       noSandbox: false,
       resumeThreadId: undefined,
       nativeResumeArgs: [],
+      nativeForkArgs: undefined,
       startingMode: undefined,
       permissionMode: 'yolo',
     })
@@ -145,6 +149,23 @@ describe('handleCodexCommand', () => {
     expect(mocks.mockRunCodex).toHaveBeenCalledWith(expect.objectContaining({
       permissionMode: 'yolo',
       nativeResumeArgs: ['--last'],
+    }))
+  })
+
+  it('passes a native fork command and options through to runCodex', async () => {
+    await handleCodexCommand([
+      'fork',
+      '--last',
+      '--sandbox',
+      'danger-full-access',
+      '--ask-for-approval',
+      'never',
+    ])
+
+    expect(mocks.mockRunCodex).toHaveBeenCalledWith(expect.objectContaining({
+      permissionMode: 'yolo',
+      nativeResumeArgs: undefined,
+      nativeForkArgs: ['--last'],
     }))
   })
 })
