@@ -423,6 +423,119 @@ describe('startCodexTuiWebSocketProxy', () => {
         ]);
     });
 
+    it('keeps an ephemeral title thread from stealing fresh-root ownership', async () => {
+        const target = await createTargetServer();
+        const selections: CodexTuiThreadSelection[] = [];
+        const notifications: CodexTuiThreadNotification[] = [];
+        const proxy = await startProxy({
+            targetEndpoint: target.endpoint,
+            onThreadSelected: (selection) => {
+                selections.push(selection);
+            },
+            onThreadNotification: (notification) => {
+                notifications.push(notification);
+            },
+        });
+
+        const rootUpstreamConnection = nextConnection(target.server);
+        const rootTui = await connect(proxy.endpoint);
+        const rootUpstream = await rootUpstreamConnection;
+        const rootRequest = collectFrames(rootUpstream, 1);
+        sendJson(rootTui, {
+            jsonrpc: '2.0', id: 1, method: 'thread/start', params: { ephemeral: false },
+        });
+        await rootRequest;
+        const rootResponse = collectFrames(rootTui, 1);
+        sendJson(rootUpstream, {
+            jsonrpc: '2.0', id: 1,
+            result: {
+                thread: {
+                    id: 'durable-root',
+                    parentThreadId: null,
+                    ephemeral: false,
+                    turns: [],
+                },
+            },
+        });
+        await rootResponse;
+
+        const titleUpstreamConnection = nextConnection(target.server);
+        const titleTui = await connect(proxy.endpoint);
+        const titleUpstream = await titleUpstreamConnection;
+        const titleRequest = collectFrames(titleUpstream, 1);
+        sendJson(titleTui, {
+            jsonrpc: '2.0', id: 1, method: 'thread/start', params: { ephemeral: true },
+        });
+        await titleRequest;
+        const titleResponse = collectFrames(titleTui, 1);
+        sendJson(titleUpstream, {
+            jsonrpc: '2.0', id: 1,
+            result: {
+                thread: {
+                    id: 'title-helper',
+                    parentThreadId: null,
+                    turns: [],
+                },
+            },
+        });
+        await titleResponse;
+
+        const responseMarkedRequest = collectFrames(titleUpstream, 1);
+        sendJson(titleTui, {
+            jsonrpc: '2.0', id: 2, method: 'thread/start', params: {},
+        });
+        await responseMarkedRequest;
+        const responseMarkedResponse = collectFrames(titleTui, 1);
+        sendJson(titleUpstream, {
+            jsonrpc: '2.0', id: 2,
+            result: {
+                thread: {
+                    id: 'response-marked-helper',
+                    parentThreadId: null,
+                    ephemeral: true,
+                    turns: [],
+                },
+            },
+        });
+        await responseMarkedResponse;
+
+        const titleCompletion = {
+            jsonrpc: '2.0',
+            method: 'turn/completed',
+            params: {
+                threadId: 'title-helper',
+                turn: { id: 'title-turn', status: 'completed', error: null },
+            },
+        };
+        const rootCompletion = {
+            jsonrpc: '2.0',
+            method: 'turn/completed',
+            params: {
+                threadId: 'durable-root',
+                turn: { id: 'root-turn', status: 'completed', error: null },
+            },
+        };
+        const forwarded = Promise.all([
+            collectFrames(titleTui, 1),
+            collectFrames(rootTui, 1),
+        ]);
+        sendJson(titleUpstream, titleCompletion);
+        sendJson(rootUpstream, rootCompletion);
+        await forwarded;
+        await proxy.waitForIdle();
+
+        expect(selections).toEqual([
+            { threadId: 'durable-root', method: 'thread/start' },
+        ]);
+        expect(notifications).toEqual([
+            {
+                threadId: 'durable-root',
+                method: 'turn/completed',
+                params: rootCompletion.params,
+            },
+        ]);
+    });
+
     it('rejects unowned fresh-thread events and keeps forwarding after callback failure', async () => {
         const target = await createTargetServer();
         const callbackError = new Error('observer callback failed');

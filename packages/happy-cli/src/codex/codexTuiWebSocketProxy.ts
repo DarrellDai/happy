@@ -47,6 +47,7 @@ type JsonRpcId = string | number;
 
 type PendingSelection = {
     method: CodexTuiSelectionMethod;
+    ephemeral: boolean;
 };
 
 type PendingFreshThreadTurn = {
@@ -142,8 +143,14 @@ function trackSelectionRequests(
         // to the most recent request observed on this exact TUI connection.
         pendingSelections.delete(id);
         if (SELECTION_METHODS.has(message.method as CodexTuiSelectionMethod)) {
+            const params = message.params !== null
+                && typeof message.params === 'object'
+                && !Array.isArray(message.params)
+                ? message.params as Record<string, unknown>
+                : null;
             pendingSelections.set(id, {
                 method: message.method as CodexTuiSelectionMethod,
+                ephemeral: params?.ephemeral === true,
             });
         }
     }
@@ -329,6 +336,14 @@ function consumeCorrelatedServerEvents(
         }
         const threadRecord = thread as Record<string, unknown>;
         if (typeof threadRecord.id !== 'string' || threadRecord.id.length === 0) {
+            continue;
+        }
+        // Codex starts ephemeral threads for auxiliary work such as generating
+        // a conversation title. They share the TUI transport but are not the
+        // user-selected conversation and must never replace Happy's root.
+        // Check both sides of the exchange for compatibility with app-server
+        // versions that may omit the response field.
+        if (pending.ephemeral || threadRecord.ephemeral === true) {
             continue;
         }
         if (threadRecord.parentThreadId !== null && threadRecord.parentThreadId !== undefined) {
